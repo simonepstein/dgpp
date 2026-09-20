@@ -271,8 +271,14 @@ DGPP_TEST(packq_gemv_rejects_geometry_outside_the_contract) {
     return false;
   };
   require(rejects(4, 96), "k=96 rejected (not a multiple of 64)");
-  require(rejects(4, 320), "k=320 rejected (not in the compiled set)");
-  require(rejects(8, 320), "int8 k=320 rejected (not in the compiled set)");
+  // 448 = 64 x 7: a whole number of groups, still uncompiled. (320, 640 and
+  // 2560 used to sit here; they are Qwen3.8-Flash-Next's widths and joined
+  // the compiled set when its int4 experts landed.)
+  require(rejects(4, 448), "k=448 rejected (not in the compiled set)");
+  require(rejects(8, 448), "int8 k=448 rejected (not in the compiled set)");
+  require(!rejects(4, 2560), "int4 k=2560 accepted (the Qwen hidden)");
+  require(!rejects(4, 640), "int4 k=640 accepted (the Qwen expert down at world 1)");
+  require(!rejects(4, 320), "int4 k=320 accepted (the same at world 2)");
   require(!rejects(4, 6144), "int4 k=6144 accepted");
   require(!rejects(8, 6144), "int8 k=6144 accepted");
   require(!rejects(4, 16384), "int4 k=16384 accepted (32 lanes x 16 chunks)");

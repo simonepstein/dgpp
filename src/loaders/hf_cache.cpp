@@ -62,8 +62,21 @@ std::string default_cache_root() {
 }
 
 std::string model_dir_in_root(const std::string& cache_root,
-                              const std::string& model_id,
+                              const std::string& spec,
                               std::string* error) {
+  // "org/name@revision" pins one snapshot instead of following refs/main:
+  // a release whose current revision the engine cannot serve, or simply a
+  // deployment that wants the bytes it was measured against. The revision
+  // is a snapshot directory name, in full or by any unambiguous prefix.
+  std::string model_id = spec, revision;
+  if (const size_t at = spec.rfind('@'); at != std::string::npos) {
+    model_id = spec.substr(0, at);
+    revision = spec.substr(at + 1);
+    if (revision.empty() || revision.find('/') != std::string::npos) {
+      *error = "malformed revision in '" + spec + "'";
+      return {};
+    }
+  }
   if (model_id.empty() || model_id.front() == '/' || model_id.back() == '/') {
     *error = "malformed model id '" + model_id + "'";
     return {};
@@ -72,6 +85,30 @@ std::string model_dir_in_root(const std::string& cache_root,
   if (!fs::is_directory(model_root)) {
     *error = "no cached model '" + model_id + "' under " + cache_root;
     return {};
+  }
+  if (!revision.empty()) {
+    const fs::path exact = model_root / "snapshots" / revision;
+    if (fs::is_directory(exact)) return exact.string();
+    std::vector<fs::path> matches;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(model_root / "snapshots", ec))
+      if (entry.is_directory() &&
+          entry.path().filename().string().rfind(revision, 0) == 0)
+        matches.push_back(entry.path());
+    if (ec) {
+      *error = "cannot list snapshots of '" + model_id + "': " + ec.message();
+      return {};
+    }
+    if (matches.empty()) {
+      *error = "model '" + model_id + "' has no snapshot '" + revision + "' under " + cache_root;
+      return {};
+    }
+    if (matches.size() > 1) {
+      *error = "revision '" + revision + "' of '" + model_id + "' matches " +
+               std::to_string(matches.size()) + " snapshots — ambiguous, refusing to guess";
+      return {};
+    }
+    return matches[0].string();
   }
 
   // refs/main pins the snapshot the hub tooling considers current.

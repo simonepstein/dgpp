@@ -40,7 +40,10 @@
 // 0x6400 | b = 1024 + b and subtract 1152.
 //
 // CONTRACT: K a multiple of 64 with at most 32 chunks per lane (int4 K <=
-// 32768, int8 K <= 16384; the compiled set is dispatch_k's); packed rows
+// 32768, int8 K <= 16384; the compiled set is dispatch_k's, GLM-5.3's
+// widths plus Qwen3.8-Flash-Next's 2560 hidden and its expert down at
+// worlds 1 and 2 — 640 and 320; world 4's 160 is not a whole 64-group and
+// no packed slice exists for it); packed rows
 // 16-byte aligned. Scales are bf16 [n, K/64] row-major; a NaN scale
 // propagates as NaN.
 #include <cuda_fp16.h>
@@ -457,12 +460,15 @@ __host__ inline void dispatch_k(int k, F&& f) {
     case 128: f(std::integral_constant<int, 128>{}); return;
     case 192: f(std::integral_constant<int, 192>{}); return;
     case 256: f(std::integral_constant<int, 256>{}); return;
+    case 320: f(std::integral_constant<int, 320>{}); return;
     case 384: f(std::integral_constant<int, 384>{}); return;
     case 512: f(std::integral_constant<int, 512>{}); return;
+    case 640: f(std::integral_constant<int, 640>{}); return;
     case 768: f(std::integral_constant<int, 768>{}); return;
     case 1024: f(std::integral_constant<int, 1024>{}); return;
     case 1536: f(std::integral_constant<int, 1536>{}); return;
     case 2048: f(std::integral_constant<int, 2048>{}); return;
+    case 2560: f(std::integral_constant<int, 2560>{}); return;
     case 3072: f(std::integral_constant<int, 3072>{}); return;
     case 4096: f(std::integral_constant<int, 4096>{}); return;
     case 6144: f(std::integral_constant<int, 6144>{}); return;
@@ -471,14 +477,14 @@ __host__ inline void dispatch_k(int k, F&& f) {
     case 16384: f(std::integral_constant<int, 16384>{}); return;
     default:
       throw std::invalid_argument(
-          "packq_gemv: K is not in the compiled set (64, 128, 192, 256, 384, 512, 768, "
-          "1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384)");
+          "packq_gemv: K is not in the compiled set (64, 128, 192, 256, 320, 384, 512, "
+          "640, 768, 1024, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384)");
   }
 }
 __host__ __device__ constexpr bool k_compiled(int k) {
-  return k == 64 || k == 128 || k == 192 || k == 256 || k == 384 || k == 512 || k == 768 ||
-         k == 1024 || k == 1536 || k == 2048 || k == 3072 || k == 4096 || k == 6144 ||
-         k == 8192 || k == 12288 || k == 16384;
+  return k == 64 || k == 128 || k == 192 || k == 256 || k == 320 || k == 384 || k == 512 ||
+         k == 640 || k == 768 || k == 1024 || k == 1536 || k == 2048 || k == 2560 ||
+         k == 3072 || k == 4096 || k == 6144 || k == 8192 || k == 12288 || k == 16384;
 }
 // Dispatch over the code width: f(std::integral_constant<int, Bits>{}).
 template <typename F>

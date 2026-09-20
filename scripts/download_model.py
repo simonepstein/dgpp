@@ -50,6 +50,9 @@ def main(argv=None):
     if cfg:
         require_head(cfg["nodes"][0])
     model = cfg["model"] if cfg else args.model
+    # A deployment that pins a snapshot downloads that one by default; an
+    # explicit --revision still wins.
+    revision = cfg["revision"] if cfg and args.revision == "main" and cfg.get("revision") else args.revision
     env = {**os.environ, **(cfg["node_env"][0] if cfg else cache_environment(values))}
     root = args.cache_dir.expanduser() if args.cache_dir else cache_root(env)
     peers = list(enumerate(cfg["nodes"]))[1:] if cfg and not args.local_only else []
@@ -59,7 +62,7 @@ def main(argv=None):
                 parser.error(f"{tool} is required for peer synchronization")
     # This is the only Hub call. No peer command invokes this downloader.
     snapshot = (cached_snapshot(model, root) if args.sync_only or args.verify_only
-                else download(model, args.revision, root))
+                else download(model, revision, root))
     size = checkpoint_size(snapshot)
     if args.activate:
         activate(snapshot)

@@ -28,6 +28,10 @@ namespace dgpp::serve {
 
 struct ClusterConfig {
   std::string model;
+  // The snapshot to serve, when the deployment must not follow refs/main —
+  // a full snapshot id or any unambiguous prefix. Empty: refs/main, as
+  // before. Reaches the loader as the model id's "@revision" suffix.
+  std::string revision;
   std::vector<std::string> nodes;  // rank = index; nodes[0] is the head
   std::string ssh_user;            // empty: the launcher's own user
   std::string release;             // the installed release the launcher runs (launcher-only; empty: the development binary)
@@ -52,6 +56,12 @@ struct ClusterConfig {
     // on the NVMe behind the page cache and gathers each step's rows on
     // the host — the single-Spark deployment.
     std::string ngram_table = "resident";
+    // Where the table's shards live when the release ships them beside the
+    // checkpoint rather than in it (the Qwen AutoRound build's `ple-table/`).
+    // A relative path is the checkpoint's own subdirectory. Empty: in the
+    // checkpoint, as every other release. A model property, not a site one,
+    // so it belongs here beside the table's residency rather than in paths.
+    std::string ngram_table_dir;
     // The Qwen dense stack's form: "checkpoint" (the default:
     // the BF16 the checkpoint ships) or "fp8" (every dense projection
     // encoded to block FP8 at load — the same recipe as the FP8 releases;
@@ -125,10 +135,6 @@ struct ClusterConfig {
     std::string stage_dir = "/tmp/bus4";     // where the launcher puts the peers' binary and config
     std::string release_dir = "~/dgpp/releases";
     std::string resident_cache;              // empty: the binary's default (~/.cache/dgpp/resident)
-    // Where the n-gram table's shards live when the release ships them
-    // beside the checkpoint rather than in it (the Qwen AutoRound build's
-    // `ple-table/`). Empty: in the checkpoint, as every other release.
-    std::string ngram_table_dir;
   } paths;
 
   int world() const { return static_cast<int>(nodes.size()); }

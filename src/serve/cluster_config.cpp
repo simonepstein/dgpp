@@ -100,6 +100,8 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         c.nodes.push_back(host);
       }
       saw_nodes = true;
+    } else if (k == "revision") {
+      c.revision = text(v, k, what);
     } else if (k == "ssh_user") {
       c.ssh_user = text(v, k, what);
     } else if (k == "release") {
@@ -171,6 +173,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (e.embed_sharding != "replicated" && e.embed_sharding != "vocab")
             fail(what, "'" + ek + "' must be \"replicated\" or \"vocab\"");
         }
+        else if (p.key == "ngram_table_dir") e.ngram_table_dir = text(x, ek, what);
         else if (p.key == "ngram_table") {
           e.ngram_table = text(x, ek, what);
           if (e.ngram_table != "resident" && e.ngram_table != "mmap")
@@ -297,7 +300,6 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "stage_dir") c.paths.stage_dir = text(p.value, pk, what);
         else if (p.key == "release_dir") c.paths.release_dir = text(p.value, pk, what);
         else if (p.key == "resident_cache") c.paths.resident_cache = text(p.value, pk, what);
-        else if (p.key == "ngram_table_dir") c.paths.ngram_table_dir = text(p.value, pk, what);
         else fail(what, "unknown key '" + pk + "'");
       }
     } else {

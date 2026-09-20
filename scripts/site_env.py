@@ -152,7 +152,7 @@ def deployment(path):
         raise ValueError("deployment config must be an object")
     if set(cfg) & {"nodes", "ssh_user", "ports"}:
         raise ValueError("move nodes, ssh_user, and ports out of the deployment JSON into .env; use world_size")
-    unknown = set(cfg) - {"model", "world_size", "release", "engine", "paths", "http"}
+    unknown = set(cfg) - {"model", "revision", "world_size", "release", "engine", "paths", "http"}
     if unknown:
         raise ValueError("unknown deployment keys: " + ", ".join(sorted(unknown)))
     if not isinstance(cfg.get("model"), str) or not cfg["model"]:

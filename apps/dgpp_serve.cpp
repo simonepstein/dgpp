@@ -1168,7 +1168,10 @@ int main(int argc, char** argv) {
     rendezvous_timeout_ms = e.rendezvous_timeout_ms;
     stats_interval_s = e.stats_interval_s;
     reasoning_in_content = e.reasoning_in_content;
-    if (!c.paths.ngram_table_dir.empty()) ngram_table_dir = c.paths.ngram_table_dir;
+    // A pinned snapshot travels with the model id (loaders/hf_cache.hpp).
+    if (!c.revision.empty() && model_id.find('@') == std::string::npos)
+      model_id += "@" + c.revision;
+    if (!e.ngram_table_dir.empty()) ngram_table_dir = e.ngram_table_dir;
     // The resident image cache's directory, unless the environment says.
     if (!c.paths.resident_cache.empty())
       setenv("DGPP_RESIDENT_CACHE_DIR",

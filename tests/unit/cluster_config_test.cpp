@@ -87,6 +87,17 @@ DGPP_TEST(cluster_config_parses_engine_rope_scaling) {
           "only yarn");
 }
 
+// A deployment that must not follow refs/main names the snapshot; the
+// loader takes it as the model id's "@revision" suffix.
+DGPP_TEST(cluster_config_pins_a_revision) {
+  const std::string json = R"({
+    "model": "org/name", "revision": "0deb648024edc9609", "nodes": ["10.0.0.1"]
+  })";
+  const dgpp::serve::ClusterConfig c = dgpp::serve::parse_cluster_config(json, "t");
+  require(c.model == "org/name" && c.revision == "0deb648024edc9609",
+          "the model and the pinned snapshot are separate fields");
+}
+
 DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   const std::string json = R"({
     "model": "org/name",
@@ -96,8 +107,9 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
     "ports": {"http": 8081, "journal": 29001},
     "engine": {"max_concurrency": 2, "decode_graph": true, "prefix_cache_gib": 0.5,
                "admission": "grow", "stats_interval_s": 0, "mtp_depth": 2, "prefill": "exact",
-               "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048},
-    "paths": {"log_dir": "/var/log/dgpp", "ngram_table_dir": "ple-table"}
+               "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048,
+               "ngram_table_dir": "ple-table"},
+    "paths": {"log_dir": "/var/log/dgpp"}
   })";
   const dgpp::serve::ClusterConfig c = dgpp::serve::parse_cluster_config(json, "t");
   require(c.model == "org/name" && c.world() == 3 && c.nodes[0] == "10.0.0.1" &&
@@ -133,7 +145,8 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   require(c.paths.log_dir == "/var/log/dgpp" && c.paths.stage_dir == "/tmp/bus4" &&
               c.paths.release_dir == "~/dgpp/releases" && c.paths.resident_cache.empty(),
           "the paths: given one taken, the rest defaulted");
-  require(c.paths.ngram_table_dir == "ple-table",
+  require(c.revision.empty(), "no revision: the deployment follows refs/main");
+  require(c.engine.ngram_table_dir == "ple-table",
           "the n-gram table's companion directory (relative: the checkpoint's own)");
   // A one-node config is a world of one.
   const dgpp::serve::ClusterConfig one =

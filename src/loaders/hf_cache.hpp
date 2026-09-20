@@ -33,5 +33,8 @@ std::string model_dir_in_root(const std::string& cache_root,
 // model_dir_in_root against default_cache_root().
 std::string model_dir(const std::string& model_id, std::string* error);
 
+// Both take "org/name" (refs/main) or "org/name@revision", where the
+// revision is a snapshot directory name in full or by unambiguous prefix.
+
 }  // namespace hf
 }  // namespace dgpp
