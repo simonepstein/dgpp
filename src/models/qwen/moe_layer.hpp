@@ -35,7 +35,12 @@ struct QwenMoeWeights {
   const GlmQuantMatrix* shared_fp8 = nullptr;  // dense_weights fp8: gate, up, down (the bf16 three null)
   int64_t shared_inter = 0;                    // S: this rank's shared slice
   const GlmQuantMatrix* experts = nullptr;     // [n_experts * 3] gate, up, down (FP8 block form)
-  const GlmFp4Matrix* experts_fp4 = nullptr;   // the NVFP4 form instead (one of the two is set)
+  const GlmFp4Matrix* experts_fp4 = nullptr;   // the NVFP4 form instead
+  // The AutoRound release's int4 form instead (exactly one of the three is
+  // set). The shared expert is not affected: it stays BF16 or block FP8,
+  // outside the routed chain, so the packed routed table needs no packed
+  // shared expert (routed_config's n_shared_experts is 0).
+  const GlmPackedMatrix* experts_packed = nullptr;
 };
 
 class QwenMoeLayer {

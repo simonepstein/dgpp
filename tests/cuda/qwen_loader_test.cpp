@@ -69,6 +69,49 @@ Fixture write_nvfp4_fixture() {
   return fx;
 }
 
+Fixture write_gptq_fixture() {
+  Fixture fx;
+  fx.cfg = qwenfx::tiny_gptq_config();
+  fx.dir = (fs::current_path() / "qwen_loader_gptq_fixture").string();
+  const std::string text = qwenfx::tiny_gptq_text_json();
+  qwenfx::write_fixture(fx.cfg, fx.dir, text.c_str(), qwenfx::tiny_gptq_quant_json());
+  fx.table = dgpp::qwen_expected_text_tensors(fx.cfg);
+  return fx;
+}
+
+// A one-tensor safetensors file, for the companion-directory tests.
+void write_one_tensor(const fs::path& path, const std::vector<std::string>& names,
+                      const std::vector<int64_t>& shape) {
+  size_t elems = 1;
+  for (auto d : shape) elems *= static_cast<size_t>(d);
+  const size_t bytes = elems * 2;
+  std::string shape_json = "[";
+  for (size_t i = 0; i < shape.size(); ++i)
+    shape_json += (i ? "," : "") + std::to_string(shape[i]);
+  shape_json += "]";
+  std::string hdr = "{";
+  for (size_t i = 0; i < names.size(); ++i)
+    hdr += (i ? ",\"" : "\"") + names[i] + "\":{\"dtype\":\"BF16\",\"shape\":" + shape_json +
+           ",\"data_offsets\":[" + std::to_string(i * bytes) + "," +
+           std::to_string((i + 1) * bytes) + "]}";
+  hdr += "}";
+  while (hdr.size() % 8) hdr += ' ';
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) throw std::runtime_error("cannot write " + path.string());
+  const uint64_t n = hdr.size();
+  std::fwrite(&n, 8, 1, f);
+  std::fwrite(hdr.data(), 1, hdr.size(), f);
+  const std::vector<uint8_t> zeros(bytes * names.size(), 0);
+  std::fwrite(zeros.data(), 1, zeros.size(), f);
+  std::fclose(f);
+}
+
+// The companion registry is process-wide: every test that touches it clears
+// it again, or the next stream in this binary inherits it.
+struct CompanionScope {
+  ~CompanionScope() { QwenLayerStream::set_ngram_table_dir(""); }
+};
+
 std::vector<uint8_t> device_bytes(const void* dev, size_t n) {
   std::vector<uint8_t> h(n);
   DGPP_CUDA_OK(cudaMemcpy(h.data(), dev, n, cudaMemcpyDeviceToHost));
@@ -538,3 +581,227 @@ DGPP_TEST(qwen_loader_refuses_tampered_hash_buffers) {
 }
 
 int main() { return dgpp::test::run_all(); }
+
+// The repack, against the checkpoint's own bytes: the engine's word for
+// (n, k-block) must be the checkpoint's word for the same pair — the two
+// layouts differ by a transpose and nothing else — and the engine's BF16
+// group scale must be the checkpoint's F16 one, rounded once and written
+// to both of the 64-element groups inside the checkpoint's 128.
+DGPP_TEST(qwen_loader_repacks_the_autoround_int4_experts) {
+  const Fixture fx = write_gptq_fixture();
+  require(fx.cfg.experts_packed && fx.cfg.lm_head_packed, "the fixture selects the int4 release");
+  const int64_t H = fx.cfg.hidden_size, I = fx.cfg.moe_intermediate_size;
+  const int64_t group = fx.cfg.packed_group;
+  QwenLayerStream::set_dense_weights_fp8(true);
+  struct Reset { ~Reset() { QwenLayerStream::set_dense_weights_fp8(false); } } reset;
+  for (int world : {1, 2}) {
+    for (int rank = 0; rank < world; ++rank) {
+      dgpp::QwenLayerStream s(fx.cfg, fx.dir, rank, world, dgpp::QwenResidency::Streaming,
+                              dgpp::QwenHeadSharding::VocabSharded);
+      const auto& layer = s.load_layer(0);
+      require(layer.moe.packq(), "the backbone experts are packed");
+      require(layer.moe.experts_packed.size() == static_cast<size_t>(fx.cfg.num_experts) * 3,
+              "every local packed expert matrix is present");
+      const int64_t local_I = I / world;
+      // gate_proj: rows [rank * local_I, +local_I) of the [I, H] matrix.
+      const std::string ep = "model.language_model.layers.0.mlp.experts.3.";
+      {
+        const dgpp::GlmPackedMatrix& m = layer.moe.experts_packed[3 * 3 + 0];
+        require(m.rows == local_I && m.cols == H && m.bits == 4, "gate_proj geometry");
+        const auto words = fx.bytes(ep + "gate_proj.qweight");
+        const auto scales = fx.bytes(ep + "gate_proj.scales");
+        const auto* sw = reinterpret_cast<const uint32_t*>(words.data());
+        const auto* ss = reinterpret_cast<const uint16_t*>(scales.data());
+        const auto got_w = device_bytes(m.packed, static_cast<size_t>(m.rows) * m.packed_cols() * 4);
+        const auto got_s = device_bytes(m.scales, m.scale_bytes());
+        const auto* gw = reinterpret_cast<const uint32_t*>(got_w.data());
+        const auto* gs = reinterpret_cast<const uint16_t*>(got_s.data());
+        for (int64_t r = 0; r < m.rows; ++r) {
+          const int64_t n = rank * local_I + r;
+          for (int64_t w = 0; w < m.packed_cols(); ++w)
+            require(gw[r * m.packed_cols() + w] == sw[w * I + n],
+                    "gate_proj word (" + std::to_string(r) + ", " + std::to_string(w) + ")");
+          for (int64_t g = 0; g < m.scale_cols(); ++g) {
+            const uint16_t want = dgpp::float_to_bf16_bits(
+                dgpp::f16_bits_to_float(ss[(g * dgpp::kPackedGroup / group) * I + n]));
+            require(gs[r * m.scale_cols() + g] == want,
+                    "gate_proj scale (" + std::to_string(r) + ", " + std::to_string(g) + ")");
+          }
+        }
+      }
+      // down_proj: columns [rank * local_I, +local_I) of the [H, I] matrix,
+      // which is a slice of qweight's FIRST axis — whole words.
+      {
+        const dgpp::GlmPackedMatrix& m = layer.moe.experts_packed[3 * 3 + 2];
+        require(m.rows == H && m.cols == local_I, "down_proj geometry");
+        const auto words = fx.bytes(ep + "down_proj.qweight");
+        const auto scales = fx.bytes(ep + "down_proj.scales");
+        const auto* sw = reinterpret_cast<const uint32_t*>(words.data());
+        const auto* ss = reinterpret_cast<const uint16_t*>(scales.data());
+        const auto got_w = device_bytes(m.packed, static_cast<size_t>(m.rows) * m.packed_cols() * 4);
+        const auto got_s = device_bytes(m.scales, m.scale_bytes());
+        const auto* gw = reinterpret_cast<const uint32_t*>(got_w.data());
+        const auto* gs = reinterpret_cast<const uint16_t*>(got_s.data());
+        const int64_t w0 = rank * local_I / 8;
+        for (int64_t r = 0; r < m.rows; ++r) {
+          for (int64_t w = 0; w < m.packed_cols(); ++w)
+            require(gw[r * m.packed_cols() + w] == sw[(w0 + w) * H + r], "down_proj word");
+          for (int64_t g = 0; g < m.scale_cols(); ++g) {
+            const int64_t k = rank * local_I + g * dgpp::kPackedGroup;
+            const uint16_t want =
+                dgpp::float_to_bf16_bits(dgpp::f16_bits_to_float(ss[(k / group) * H + r]));
+            require(gs[r * m.scale_cols() + g] == want, "down_proj scale");
+          }
+        }
+      }
+    }
+  }
+}
+
+// The draft layer is outside the int4 pass: its experts are BF16 in the
+// checkpoint and take the same load-time FP8 encoding as the dense stack,
+// so the layer stays on the FP8 expert path.
+DGPP_TEST(qwen_loader_keeps_the_autoround_draft_layer_off_the_packed_path) {
+  const Fixture fx = write_gptq_fixture();
+  QwenLayerStream::set_dense_weights_fp8(true);
+  struct Reset { ~Reset() { QwenLayerStream::set_dense_weights_fp8(false); } } reset;
+  dgpp::QwenLayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Streaming,
+                          dgpp::QwenHeadSharding::VocabSharded);
+  const auto& draft = s.load_layer(fx.cfg.mtp_layer());
+  require(!draft.moe.packq(), "the draft layer's experts are not packed");
+  require(draft.moe.experts.size() == static_cast<size_t>(fx.cfg.num_experts) * 3,
+          "the draft layer's experts took the FP8 path");
+  require(draft.moe.experts[0].payload != nullptr, "the draft layer's experts are resident");
+}
+
+// The dense stack of the int4 release is the checkpoint's own block FP8,
+// sliced rather than encoded — and the draft layer, which no release
+// quantizes, stays BF16 beside it.
+DGPP_TEST(qwen_loader_reads_the_autoround_dense_stack_as_checkpoint_fp8) {
+  const Fixture fx = write_gptq_fixture();
+  require(fx.cfg.dense_stack_fp8, "the fixture's dense stack is quantized");
+  QwenLayerStream::set_dense_weights_fp8(true);
+  struct Reset { ~Reset() { QwenLayerStream::set_dense_weights_fp8(false); } } reset;
+  QwenLayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Streaming,
+                    dgpp::QwenHeadSharding::VocabSharded);
+  {
+    const auto& l = s.load_layer(0);  // a GDN layer
+    require(l.gdn.in_proj_qkv == nullptr && l.gdn.in_proj_qkv_fp8.payload != nullptr,
+            "the GDN stack is FP8");
+    require(l.gdn.in_proj_z_fp8.payload && l.gdn.out_proj_fp8.payload, "z and out_proj are FP8");
+    require(l.gdn.in_proj_a != nullptr && l.gdn.norm != nullptr, "a and the norm stay BF16");
+    require(l.moe.shared_fp8[0].payload && l.moe.shared[0] == nullptr, "the shared expert is FP8");
+    // The fused [q | k | v] stack carries the source's payload bytes, in
+    // segment order, and the source's scale grid with it.
+    const std::string p = dgpp::qwen_layer_prefix(fx.cfg, 0);
+    const auto src = fx.bytes(p + "linear_attn.in_proj_qkv.weight");
+    const auto& m = l.gdn.in_proj_qkv_fp8;
+    const auto got = device_bytes(m.payload, static_cast<size_t>(m.rows) * m.cols);
+    require(std::memcmp(got.data(), src.data(), got.size()) == 0,
+            "world 1 takes the qkv stack byte for byte");
+  }
+  {
+    // The draft layer is BF16 IN THE CHECKPOINT — the binding says so — and
+    // takes the ordinary load-time encoding from there, unlike the backbone
+    // whose bytes are already e4m3.
+    const std::string dp = dgpp::qwen_layer_prefix(fx.cfg, fx.cfg.mtp_layer());
+    const std::string bp = dgpp::qwen_layer_prefix(fx.cfg, 2);  // a QSA backbone layer
+    require(fx.expected(dp + "self_attn.q_proj.weight").dtype == dgpp::DType::BF16,
+            "the draft layer's q_proj is BF16 in the checkpoint");
+    require(fx.expected(bp + "self_attn.q_proj.weight").dtype == dgpp::DType::F8_E4M3,
+            "the backbone's q_proj is e4m3 in the checkpoint");
+    const auto& d = s.load_layer(fx.cfg.mtp_layer());
+    require(d.qsa.q_proj == nullptr && d.qsa.q_proj_fp8.payload != nullptr,
+            "and is encoded to FP8 at load, like every other BF16 dense matrix");
+  }
+}
+
+// engine.dense_weights = "bf16" against a checkpoint with no BF16 dense
+// stack is refused, by name, rather than quietly served as FP8.
+DGPP_TEST(qwen_loader_refuses_bf16_dense_weights_on_a_quantized_dense_stack) {
+  const Fixture fx = write_gptq_fixture();
+  require(!QwenLayerStream::dense_weights_fp8(), "the default is the checkpoint's form");
+  std::string msg;
+  try {
+    QwenLayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Streaming,
+                      dgpp::QwenHeadSharding::VocabSharded);
+  } catch (const std::runtime_error& e) {
+    msg = e.what();
+  }
+  require(msg.find("dense_weights") != std::string::npos, "refused, naming the setting");
+}
+
+// The n-gram table in a companion directory: only the table's own tensors
+// come across. The real `ple-table/` also carries its own copy of another
+// layer's weights, which would collide with the checkpoint's under the
+// duplicate guard — so the filter is what makes the companion usable, and
+// these two refusals pin it. A non-matching duplicate is SKIPPED (the
+// directory then has nothing of the table's, which is the error we get);
+// a matching duplicate is REFUSED by name.
+DGPP_TEST(qwen_loader_takes_only_the_table_from_a_companion_directory) {
+  const Fixture fx = write_fixture();
+  const auto refusal_with = [&](const std::string& sub, const std::vector<std::string>& names,
+                                const std::vector<int64_t>& shape) {
+    const fs::path dir = fs::path(fx.dir) / sub;
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    write_one_tensor(dir / "companion.safetensors", names, shape);
+    CompanionScope scope;
+    QwenLayerStream::set_ngram_table_dir(dir.string());
+    try {
+      QwenLayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Streaming,
+                        dgpp::QwenHeadSharding::VocabSharded);
+    } catch (const std::runtime_error& e) {
+      return std::string(e.what());
+    }
+    return std::string();
+  };
+  // A name the checkpoint already has, outside the table: skipped, so the
+  // companion is reported as carrying no table rather than as a duplicate.
+  const std::string skipped =
+      refusal_with("companion_other", {"model.language_model.layers.0.linear_attn.norm.weight"},
+                   {fx.cfg.gdn_value_head_dim});
+  require(skipped.find("no tensor matching") != std::string::npos,
+          "a non-table duplicate is filtered out, not collided with: " + skipped);
+  // One of the table's own, which the fixture keeps in the checkpoint: the
+  // duplicate guard catches it and names it.
+  const std::string p = dgpp::qwen_layer_prefix(fx.cfg, fx.cfg.ple_layer());
+  const std::string table = p + "ple.ple_embedding.ngram_embedding.shard_0.weight";
+  const std::string collided = refusal_with("companion_dup", {table}, {8, 8});
+  require(collided.find("already in the checkpoint") != std::string::npos &&
+              collided.find("shard_0") != std::string::npos,
+          "a table tensor the checkpoint already has is refused by name: " + collided);
+}
+
+DGPP_TEST(qwen_loader_refuses_a_companion_directory_that_carries_no_table) {
+  const Fixture fx = write_fixture();
+  CompanionScope scope;
+  {
+    QwenLayerStream::set_ngram_table_dir((fs::path(fx.dir) / "nowhere").string());
+    std::string msg;
+    try {
+      QwenLayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Streaming,
+                        dgpp::QwenHeadSharding::VocabSharded);
+    } catch (const std::runtime_error& e) {
+      msg = e.what();
+    }
+    require(msg.find("companion directory does not exist") != std::string::npos,
+            "a missing directory is refused");
+  }
+  {
+    const fs::path dir = fs::path(fx.dir) / "empty_companion";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    write_one_tensor(dir / "other.safetensors", {"something.else.weight"}, {8});
+    QwenLayerStream::set_ngram_table_dir(dir.string());
+    std::string msg;
+    try {
+      QwenLayerStream s(fx.cfg, fx.dir, 0, 1, dgpp::QwenResidency::Streaming,
+                        dgpp::QwenHeadSharding::VocabSharded);
+    } catch (const std::runtime_error& e) {
+      msg = e.what();
+    }
+    require(msg.find("no tensor matching") != std::string::npos,
+            "a directory with nothing of the table's is refused, naming the filter");
+  }
+}

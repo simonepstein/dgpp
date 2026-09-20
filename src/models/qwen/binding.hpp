@@ -53,6 +53,12 @@ enum class QwenTensorRole : uint8_t {
   Fp4Scale,    // F8_E4M3 [N, K/16]
   Fp4Global,   // F32 [], the matrix's weight_scale_2
   InputScale,  // F32 [], the recipe's activation scale (unused: W4A16)
+  // The auto_gptq int4 triple (the AutoRound release's routed experts and
+  // head). `qweight` packs 8 codes per I32 along K exactly as the engine's
+  // packed form does, transposed: [K/8, N] against the engine's [N, K/8].
+  PackedWords,  // I32 [K/8, N]
+  PackedScale,  // F16 [K/group, N]
+  PackedZeros,  // I32 [K/group, N/8], constant under sym (checked, then dropped)
 };
 
 struct QwenExpectedTensor {

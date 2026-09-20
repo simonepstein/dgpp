@@ -65,6 +65,11 @@ bool is_replicated(const QwenExpectedTensor& e) {
   return false;
 }
 
+// auto_gptq packs 32/bits codes per I32 word and so does the engine's
+// packed form, which is what makes the repack a transpose. Only int4 is
+// implemented (models/qwen/config.cpp refuses the rest).
+constexpr int64_t kGptqCodesPerWord = 8;
+
 int gcd_int(int a, int b) { return std::gcd(a, b); }
 
 std::pair<int, int> lm_head_slice(const QwenTextConfig& cfg, int rank, int world) {
@@ -84,6 +89,7 @@ std::string& resident_image_dir_storage() {
 bool g_ngram_table_mmap = false;
 // The dense stack's form (engine.dense_weights = "fp8", 2026-09-10).
 bool g_dense_weights_fp8 = false;
+std::string g_ngram_table_dir;
 }  // namespace
 
 // The per-class builders (loaders/weight_build.hpp's primitives).
@@ -150,7 +156,11 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     // matrix, byte for byte.
     const int64_t local_rows = 2 * lk * dk + lv * dv;
     const std::string qkv_name = p + "in_proj_qkv.weight";
-    if (g_dense_weights_fp8) {
+    if (dense_fp8()) {
+      g.in_proj_qkv_fp8 = load_quant_rows_fused(
+          qkv_name, {{r * lk * dk, lk * dk}, {K + r * lk * dk, lk * dk},
+                     {2 * K + r * lv * dv, lv * dv}});
+    } else if (g_dense_weights_fp8) {
       // The three segments assembled on the host, encoded into the bump.
       std::vector<uint16_t> merged;
       if (copy) {
@@ -186,7 +196,10 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     copy_rows_into(conv_name, 2 * K + r * lv * dv, lv * dv, conv, 2 * lk * dk);
     if (copy) consumed(source(conv_name));
     g.conv = conv;
-    if (g_dense_weights_fp8)
+    if (dense_fp8())
+      g.in_proj_z_fp8 = load_quant_rows(p + "in_proj_z.weight", r * lv * dv, lv * dv,
+                                        slice_scale_block(lv * dv));
+    else if (g_dense_weights_fp8)
       g.in_proj_z_fp8 = load_bf16_rows_fp8(p + "in_proj_z.weight", r * lv * dv, lv * dv);
     else
       g.in_proj_z = load_bf16_rows(p + "in_proj_z.weight", r * lv * dv, lv * dv);
@@ -195,7 +208,10 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     g.a_log = load_bf16_as_f32(p + "A_log", r * lv, lv);
     g.dt_bias = load_bf16_as_f32(p + "dt_bias", r * lv, lv);
     g.norm = load_bf16(p + "norm.weight");
-    if (g_dense_weights_fp8)
+    if (dense_fp8())
+      g.out_proj_fp8 = load_quant_cols(p + "out_proj.weight", r * lv * dv, lv * dv,
+                                       slice_scale_block(lv * dv));
+    else if (g_dense_weights_fp8)
       g.out_proj_fp8 = load_bf16_cols_fp8(p + "out_proj.weight", r * lv * dv, lv * dv);
     else
       g.out_proj = load_bf16_cols(p + "out_proj.weight", r * lv * dv, lv * dv);
@@ -211,7 +227,12 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     const int64_t q0 = static_cast<int64_t>(geo.head_begin) * 2 * d, qn = static_cast<int64_t>(geo.local_heads) * 2 * d;
     const int64_t kv0 = static_cast<int64_t>(geo.kv_head_begin) * d, kvn = static_cast<int64_t>(geo.local_kv_heads) * d;
     const int64_t o0 = static_cast<int64_t>(geo.head_begin) * d, on = static_cast<int64_t>(geo.local_heads) * d;
-    if (g_dense_weights_fp8) {
+    if (dense_fp8()) {
+      a.q_proj_fp8 = load_quant_rows(p + "q_proj.weight", q0, qn, slice_scale_block(qn));
+      a.k_proj_fp8 = load_quant_rows(p + "k_proj.weight", kv0, kvn, slice_scale_block(kvn));
+      a.v_proj_fp8 = load_quant_rows(p + "v_proj.weight", kv0, kvn, slice_scale_block(kvn));
+      a.o_proj_fp8 = load_quant_cols(p + "o_proj.weight", o0, on, slice_scale_block(on));
+    } else if (g_dense_weights_fp8) {
       a.q_proj_fp8 = load_bf16_rows_fp8(p + "q_proj.weight", q0, qn);
       a.k_proj_fp8 = load_bf16_rows_fp8(p + "k_proj.weight", kv0, kvn);
       a.v_proj_fp8 = load_bf16_rows_fp8(p + "v_proj.weight", kv0, kvn);
@@ -242,7 +263,12 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     m.local_shared_inter = S;
     m.scale_block = geo.scale_block;
     const std::string sp = p + "shared_expert.";
-    if (g_dense_weights_fp8) {
+    if (dense_fp8()) {
+      const int sb = slice_scale_block(S);
+      m.shared_fp8[0] = load_quant_rows(sp + "gate_proj.weight", r * S, S, sb);
+      m.shared_fp8[1] = load_quant_rows(sp + "up_proj.weight", r * S, S, sb);
+      m.shared_fp8[2] = load_quant_cols(sp + "down_proj.weight", r * S, S, sb);
+    } else if (g_dense_weights_fp8) {
       m.shared_fp8[0] = load_bf16_rows_fp8(sp + "gate_proj.weight", r * S, S);
       m.shared_fp8[1] = load_bf16_rows_fp8(sp + "up_proj.weight", r * S, S);
       m.shared_fp8[2] = load_bf16_cols_fp8(sp + "down_proj.weight", r * S, S);
@@ -267,9 +293,38 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
       }
       return;
     }
+    // The AutoRound release's backbone experts: the auto_gptq triple
+    // transposed into the engine's packed form, sliced on the intermediate
+    // axis like the other two — rows for gate/up, whole 64-groups of
+    // columns for down.
+    if (cfg.experts_packed && p.rfind("mtp.", 0) != 0) {
+      m.experts_packed.resize(static_cast<size_t>(E) * 3);
+      for (int e = 0; e < E; ++e) {
+        const std::string ep = p + "experts." + std::to_string(e) + ".";
+        m.experts_packed[static_cast<size_t>(e) * 3 + 0] =
+            load_packq_rows_gptq(ep + "gate_proj", r * I, I);
+        m.experts_packed[static_cast<size_t>(e) * 3 + 1] =
+            load_packq_rows_gptq(ep + "up_proj", r * I, I);
+        m.experts_packed[static_cast<size_t>(e) * 3 + 2] =
+            load_packq_cols_gptq(ep + "down_proj", r * I, I);
+      }
+      return;
+    }
     m.experts.resize(static_cast<size_t>(E) * 3);
     for (int e = 0; e < E; ++e) {
       const std::string ep = p + "experts." + std::to_string(e) + ".";
+      // The AutoRound release leaves the draft layer's experts in BF16;
+      // they take the same load-time FP8 encoding as every other BF16
+      // dense matrix, so the draft layer stays on the FP8 expert path.
+      if (cfg.experts_packed) {
+        m.experts[static_cast<size_t>(e) * 3 + 0] =
+            load_bf16_rows_fp8(ep + "gate_proj.weight", r * I, I);
+        m.experts[static_cast<size_t>(e) * 3 + 1] =
+            load_bf16_rows_fp8(ep + "up_proj.weight", r * I, I);
+        m.experts[static_cast<size_t>(e) * 3 + 2] =
+            load_bf16_cols_fp8(ep + "down_proj.weight", r * I, I);
+        continue;
+      }
       m.experts[static_cast<size_t>(e) * 3 + 0] =
           load_quant_rows(ep + "gate_proj.weight", r * I, I, geo.scale_block);
       m.experts[static_cast<size_t>(e) * 3 + 1] =
@@ -277,6 +332,197 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
       m.experts[static_cast<size_t>(e) * 3 + 2] =
           load_quant_cols(ep + "down_proj.weight", r * I, I, geo.scale_block);
     }
+  }
+
+  // ---- the checkpoint's own dense FP8 -------------------------------------
+  // The AutoRound release ships the QSA and GDN projections and the shared
+  // experts as e4m3 + an F32 128x128 grid rather than BF16, so those sites
+  // slice the checkpoint instead of encoding it (the draft layer, which no
+  // release quantizes, stays on the BF16 path).
+  bool dense_fp8() const { return cfg.dense_stack_fp8 && out.layer != cfg.mtp_layer(); }
+  // A slice at `rows` (start r * rows) re-blocks the scale grid at the
+  // largest block that divides both, exactly as the routed experts do.
+  static int slice_scale_block(int64_t rows) {
+    return static_cast<int>(std::gcd<int64_t>(128, rows));
+  }
+  // Several row ranges of one quantized matrix as a single resident matrix
+  // (the GDN's [q | k | v] stack). Payload rows are contiguous, so each
+  // segment is a memcpy; the scale grid comes across a block at a time,
+  // which needs every segment's start AND its destination row to be
+  // aligned to the block — checked here rather than assumed.
+  GlmQuantMatrix load_quant_rows_fused(const std::string& name,
+                                       const std::vector<std::pair<int64_t, int64_t>>& segs) {
+    const QwenExpectedTensor& e = expected(name);
+    const QwenExpectedTensor& es = expected(name + "_scale_inv");
+    const int64_t cols = e.shape[1];
+    const int64_t sb = (cols + 127) / 128;
+    int64_t rows = 0;
+    int64_t block = 128;
+    for (const auto& seg : segs) {
+      rows += seg.second;
+      block = std::gcd(block, seg.first);
+      block = std::gcd(block, seg.second);
+    }
+    const int sbr = static_cast<int>(block);
+    const int64_t scale_rows = (rows + sbr - 1) / sbr;
+    GlmQuantMatrix q;
+    q.rows = rows;
+    q.cols = cols;
+    q.scale_block_rows = sbr;
+    q.payload = static_cast<const uint8_t*>(
+        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols)));
+    q.scales = static_cast<const float*>(bump.alloc(static_cast<size_t>(scale_rows) * sb * 4));
+    if (copy) {
+      const TensorInfo& tp = source(name);
+      const TensorInfo& ts = source(es.name);
+      uint8_t* hp = bump.host(const_cast<uint8_t*>(q.payload));
+      float* hs = bump.host(const_cast<float*>(q.scales));
+      int64_t dst = 0;
+      for (const auto& seg : segs) {
+        if (seg.first % sbr != 0 || dst % sbr != 0)
+          fail("fused quantized rows of '" + name + "' cross a scale block");
+        std::memcpy(hp + dst * cols,
+                    static_cast<const uint8_t*>(tp.data) + seg.first * cols,
+                    static_cast<size_t>(seg.second) * cols);
+        for (int64_t r = 0; r < (seg.second + sbr - 1) / sbr; ++r)
+          copy_scale_row(ts, ((seg.first + r * sbr) / 128) * sb, sb,
+                         hs + (dst / sbr + r) * sb);
+        dst += seg.second;
+      }
+      consumed(tp);
+      consumed(ts);
+    }
+    note_read(e, static_cast<size_t>(rows) * cols +
+                     static_cast<size_t>(scale_rows) * sb * dtype_size(es.dtype));
+    return q;
+  }
+
+  // ---- auto_gptq int4 slices, repacked ------------------------------------
+  // `base` names the matrix ("...gate_proj"): base.qweight I32 [K/8, N],
+  // base.scales F16 [K/group, N], base.qzeros I32 [K/group, N/8].
+  //
+  // The checkpoint and the engine pack a code the same way — 8 per I32
+  // along K, the lowest k in the low nibble — so the 32-bit words are
+  // already the engine's and THE REPACK IS A TRANSPOSE: qweight is
+  // k-major, the engine's weight_packed is n-major. Two things change
+  // around it: the checkpoint's 128-element group becomes two of the
+  // engine's 64-element groups carrying the same scale (exact), and the
+  // F16 scale is rounded once to BF16 (measured: 0.16% rms, 0.39% worst,
+  // the 2^-8 bound — tools/gptq_repack.py verify).
+  //
+  // Symmetric quantization writes a constant zero point of 2^(bits-1),
+  // which is the offset the engine's codes already carry, so qzeros is
+  // checked and dropped rather than assumed away.
+  void check_gptq_zeros(const std::string& base) {
+    const QwenExpectedTensor& ez = expected(base + ".qzeros");
+    if (copy) {
+      const TensorInfo& t = source(ez.name);
+      const uint32_t* z = static_cast<const uint32_t*>(t.data);
+      const size_t n = ez.numel();
+      for (size_t i = 0; i < n; ++i)
+        if (z[i] != 0x77777777u)
+          fail("'" + ez.name + "' is not the symmetric constant: the loader implements only "
+               "sym=true, whose zero point is 2^(bits-1) and is already in the codes");
+      consumed(t);
+    }
+    note_read(ez, ez.numel() * 4);
+  }
+  // The geometry the three tensors agree on, or a failure naming the base.
+  struct GptqSource {
+    const QwenExpectedTensor* words;
+    const QwenExpectedTensor* scales;
+    int64_t N, K;
+  };
+  GptqSource gptq_source(const std::string& base) {
+    GptqSource s;
+    s.words = &expected(base + ".qweight");
+    s.scales = &expected(base + ".scales");
+    if (s.words->shape.size() != 2 || s.scales->shape.size() != 2)
+      fail("'" + base + "' is not a packed matrix");
+    s.N = s.words->shape[1];
+    s.K = s.words->shape[0] * kGptqCodesPerWord;
+    packed_check_cols(s.K, cfg.packed_bits, who.c_str());
+    if (s.scales->shape[0] != s.K / cfg.packed_group || s.scales->shape[1] != s.N)
+      fail("packed scale geometry mismatch on " + base);
+    return s;
+  }
+  GlmPackedMatrix alloc_packed(int64_t rows, int64_t cols) {
+    GlmPackedMatrix q;
+    q.rows = rows;
+    q.cols = cols;
+    q.bits = cfg.packed_bits;
+    q.packed = static_cast<const uint32_t*>(
+        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(q.packed_cols()) * 4));
+    q.scales = static_cast<const uint16_t*>(
+        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(q.scale_cols()) * 2));
+    return q;
+  }
+  // One row of the engine's scales from the checkpoint's column of them:
+  // `src` steps by N, each value covering group/64 of the engine's groups.
+  void repack_scale_row(const uint16_t* src, int64_t N, int64_t k_begin, int64_t cols,
+                        uint16_t* dst) {
+    for (int64_t g = 0; g < cols / kPackedGroup; ++g) {
+      const int64_t src_g = (k_begin + g * kPackedGroup) / cfg.packed_group;
+      dst[g] = float_to_bf16_bits(f16_bits_to_float(src[src_g * N]));
+    }
+  }
+  // Rows [row_start, +rows) of the [N, K] matrix: a slice of qweight's
+  // SECOND axis, gathered into contiguous engine rows.
+  GlmPackedMatrix load_packq_rows_gptq(const std::string& base, int64_t row_start, int64_t rows) {
+    const GptqSource s = gptq_source(base);
+    check_range(base, row_start, rows, s.N);
+    GlmPackedMatrix q = alloc_packed(rows, s.K);
+    const int64_t kw = s.K / kGptqCodesPerWord;
+    if (copy) {
+      const TensorInfo& tw = source(s.words->name);
+      const TensorInfo& ts = source(s.scales->name);
+      const uint32_t* sw = static_cast<const uint32_t*>(tw.data);
+      const uint16_t* ss = static_cast<const uint16_t*>(ts.data);
+      uint32_t* dw = bump.host(const_cast<uint32_t*>(q.packed));
+      uint16_t* ds = bump.host(const_cast<uint16_t*>(q.scales));
+      for (int64_t r = 0; r < rows; ++r) {
+        const int64_t n = row_start + r;
+        for (int64_t w = 0; w < kw; ++w) dw[r * kw + w] = sw[w * s.N + n];
+        repack_scale_row(ss + n, s.N, 0, s.K, ds + r * q.scale_cols());
+      }
+      consumed(tw);
+      consumed(ts);
+    }
+    note_read(*s.words, static_cast<size_t>(rows) * static_cast<size_t>(kw) * 4);
+    note_read(*s.scales, static_cast<size_t>(rows) * static_cast<size_t>(s.K / cfg.packed_group) * 2);
+    check_gptq_zeros(base);
+    return q;
+  }
+  // Columns [col_start, +cols) of every row: a slice of qweight's FIRST
+  // axis, so whole words. The start must be on one of the engine's
+  // 64-element groups, which is inside one of the checkpoint's.
+  GlmPackedMatrix load_packq_cols_gptq(const std::string& base, int64_t col_start, int64_t cols) {
+    const GptqSource s = gptq_source(base);
+    packed_check_cols(cols, cfg.packed_bits, who.c_str());
+    if (col_start % kPackedGroup != 0)
+      fail("packed column slice of '" + base + "' must start on a " +
+           std::to_string(kPackedGroup) + "-element group boundary");
+    check_range(base, col_start, cols, s.K);
+    GlmPackedMatrix q = alloc_packed(s.N, cols);
+    const int64_t kw = cols / kGptqCodesPerWord, w0 = col_start / kGptqCodesPerWord;
+    if (copy) {
+      const TensorInfo& tw = source(s.words->name);
+      const TensorInfo& ts = source(s.scales->name);
+      const uint32_t* sw = static_cast<const uint32_t*>(tw.data);
+      const uint16_t* ss = static_cast<const uint16_t*>(ts.data);
+      uint32_t* dw = bump.host(const_cast<uint32_t*>(q.packed));
+      uint16_t* ds = bump.host(const_cast<uint16_t*>(q.scales));
+      for (int64_t r = 0; r < s.N; ++r) {
+        for (int64_t w = 0; w < kw; ++w) dw[r * kw + w] = sw[(w0 + w) * s.N + r];
+        repack_scale_row(ss + r, s.N, col_start, cols, ds + r * q.scale_cols());
+      }
+      consumed(tw);
+      consumed(ts);
+    }
+    note_read(*s.words, static_cast<size_t>(s.N) * static_cast<size_t>(kw) * 4);
+    note_read(*s.scales, static_cast<size_t>(s.N) * static_cast<size_t>(cols / cfg.packed_group) * 2);
+    check_gptq_zeros(base);
+    return q;
   }
 
   // ---- NVFP4 slices in the modelopt layout (as models/glm4/loader.cpp) ------
@@ -616,31 +862,85 @@ void QwenLoaderFamily::build_globals(const QwenTextConfig& cfg_, const QwenLocal
   };
   globals_.embed = copy_global("model.language_model.embed_tokens.weight");
   {
-    const TensorInfo& t = lookup("lm_head.weight");
     const size_t row_bytes = static_cast<size_t>(cfg_.hidden_size) * 2;
     const int begin = geo_.lm_vocab_begin, count = geo_.lm_vocab_count;
+    const int64_t H = cfg_.hidden_size;
+    // The AutoRound release quantizes the head and ships no BF16 copy of
+    // it, so its rows are dequantized here — into the BF16 head, or a
+    // 128-row band at a time through the FP8 encoder (the band is the
+    // scale grid's own row block, so the encoding is the whole matrix's).
+    // Both head forms below are otherwise untouched.
+    const bool packed_head = cfg_.lm_head_packed;
+    const TensorInfo* t = packed_head ? nullptr : &lookup("lm_head.weight");
+    const auto dequant_head_rows = [&](int64_t row_start, int64_t rows, uint16_t* dst) {
+      const TensorInfo& tw = lookup("lm_head.qweight");
+      const TensorInfo& ts = lookup("lm_head.scales");
+      const int64_t N = cfg_.vocab_size, group = cfg_.packed_group;
+      const uint32_t* sw = static_cast<const uint32_t*>(tw.data);
+      const uint16_t* ss = static_cast<const uint16_t*>(ts.data);
+      for (int64_t r = 0; r < rows; ++r) {
+        const int64_t n = row_start + r;
+        for (int64_t k = 0; k < H; ++k) {
+          const uint32_t word = sw[(k / kGptqCodesPerWord) * N + n];
+          const int code =
+              static_cast<int>((word >> (4 * (k % kGptqCodesPerWord))) & 0xFu) - 8;
+          const float scale = f16_bits_to_float(ss[(k / group) * N + n]);
+          dst[r * H + k] = float_to_bf16_bits(static_cast<float>(code) * scale);
+        }
+      }
+    };
+    if (packed_head) {
+      // The same symmetric-constant check the experts get: a head with real
+      // zero points would dequantize to the wrong numbers, silently.
+      const TensorInfo& tz = lookup("lm_head.qzeros");
+      const uint32_t* z = static_cast<const uint32_t*>(tz.data);
+      for (size_t i = 0; i < tz.nbytes() / 4; ++i)
+        if (z[i] != 0x77777777u)
+          throw std::runtime_error(
+              "qwen loader: 'lm_head.qzeros' is not the symmetric constant (the loader "
+              "implements only sym=true, whose zero point is already in the codes)");
+    }
     if (g_dense_weights_fp8) {
-      const int64_t H = cfg_.hidden_size;
       GlmQuantMatrix q;
       q.rows = count;
       q.cols = H;
       q.payload = static_cast<const uint8_t*>(globals_bump_->alloc(static_cast<size_t>(count) * H));
       q.scales = static_cast<const float*>(globals_bump_->alloc(
           static_cast<size_t>(fp8_quant::scale_rows(count)) * fp8_quant::scale_cols(H) * 4));
-      fp8_quant::encode_block128(static_cast<const uint16_t*>(t.data) + static_cast<size_t>(begin) * H,
-                                 static_cast<size_t>(H), count, H,
-                                 globals_bump_->host(const_cast<uint8_t*>(q.payload)),
-                                 globals_bump_->host(const_cast<float*>(q.scales)));
+      uint8_t* hp = globals_bump_->host(const_cast<uint8_t*>(q.payload));
+      float* hs = globals_bump_->host(const_cast<float*>(q.scales));
+      if (packed_head) {
+        const int64_t band = 128, sc = fp8_quant::scale_cols(H);
+        std::vector<uint16_t> rows_bf16(static_cast<size_t>(band) * H);
+        for (int64_t r0 = 0; r0 < count; r0 += band) {
+          const int64_t n = std::min<int64_t>(band, count - r0);
+          dequant_head_rows(begin + r0, n, rows_bf16.data());
+          fp8_quant::encode_block128(rows_bf16.data(), static_cast<size_t>(H), n, H,
+                                     hp + static_cast<size_t>(r0) * H,
+                                     hs + static_cast<size_t>(r0 / band) * sc);
+        }
+      } else {
+        fp8_quant::encode_block128(static_cast<const uint16_t*>(t->data) + static_cast<size_t>(begin) * H,
+                                   static_cast<size_t>(H), count, H, hp, hs);
+      }
       globals_.lm_head_fp8 = q;
     } else {
       uint16_t* dst = static_cast<uint16_t*>(globals_bump_->alloc(static_cast<size_t>(count) * row_bytes));
-      std::memcpy(globals_bump_->host(dst),
-                  static_cast<const uint8_t*>(t.data) + static_cast<size_t>(begin) * row_bytes,
-                  static_cast<size_t>(count) * row_bytes);
-      if (head_ == LoaderHeadSharding::Full) verbatim_bytes_ += static_cast<size_t>(count) * row_bytes;
+      if (packed_head) {
+        dequant_head_rows(begin, count, globals_bump_->host(dst));
+      } else {
+        std::memcpy(globals_bump_->host(dst),
+                    static_cast<const uint8_t*>(t->data) + static_cast<size_t>(begin) * row_bytes,
+                    static_cast<size_t>(count) * row_bytes);
+        if (head_ == LoaderHeadSharding::Full) verbatim_bytes_ += static_cast<size_t>(count) * row_bytes;
+      }
       globals_.lm_head = dst;
     }
-    source_bytes_ += static_cast<size_t>(count) * row_bytes;
+    // The int4 head's source is half a byte per weight plus its scales.
+    source_bytes_ += packed_head
+                         ? static_cast<size_t>(count) * H / 2 +
+                               static_cast<size_t>(count) * H / cfg_.packed_group * 2
+                         : static_cast<size_t>(count) * row_bytes;
     globals_.lm_vocab_begin = begin;
     globals_.lm_vocab_count = count;
   }
@@ -658,11 +958,28 @@ template class ResidentLayerStream<QwenLoaderFamily>;
 
 // ---------------------------------------------------------------------------
 
+// The table's tensors are the ones under `ple_embedding.ngram_embedding.`
+// — the shards and the per-tensor scale. Everything else the companion
+// carries (this release's ships a second copy of layer 1) is left behind.
+void QwenLayerStream::set_ngram_table_dir(const std::string& dir) {
+  g_ngram_table_dir = dir;
+  clear_companion_dirs();
+  if (!dir.empty()) add_companion_dir(dir, "ple_embedding.ngram_embedding.");
+}
+const std::string& QwenLayerStream::ngram_table_dir() { return g_ngram_table_dir; }
+
 QwenLayerStream::QwenLayerStream(const QwenTextConfig& cfg, const std::string& checkpoint_dir,
                                  int rank, int world, QwenResidency residency,
                                  QwenHeadSharding head, bool resident_mtp)
     : ResidentLayerStream<QwenLoaderFamily>(cfg, checkpoint_dir, rank, world, residency, head,
                                             resident_mtp) {
+  // A release whose dense stack is already e4m3 has no BF16 to give back:
+  // engine.dense_weights = "bf16" would need a dequantizing load, which is
+  // not implemented. Refuse by name rather than quietly serving FP8.
+  if (cfg.dense_stack_fp8 && !g_dense_weights_fp8)
+    throw std::runtime_error(
+        "qwen loader: engine.dense_weights = \"bf16\" but this release ships the dense "
+        "stack in block FP8 (no BF16 copy exists in the checkpoint); set it to \"fp8\"");
   open_resident_image();
 }
 

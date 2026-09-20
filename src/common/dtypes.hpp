@@ -76,6 +76,27 @@ DGPP_HD inline float bf16_bits_to_float(uint16_t b) {
   return std::bit_cast<float>(static_cast<uint32_t>(b) << 16);
 }
 
+// IEEE binary16 to float, exact (every f16 is a float). The auto_gptq
+// checkpoints keep their group scales in F16; the engine's packed-int form
+// keeps BF16, so the loader goes through this and rounds once.
+DGPP_HD inline float f16_bits_to_float(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t man = h & 0x3FFu;
+  if (exp == 0) {
+    if (man == 0) return std::bit_cast<float>(sign);
+    int e = -14;  // the subnormal's exponent, normalized below
+    while (!(man & 0x400u)) {
+      man <<= 1;
+      --e;
+    }
+    man &= 0x3FFu;
+    return std::bit_cast<float>(sign | (static_cast<uint32_t>(e + 127) << 23) | (man << 13));
+  }
+  if (exp == 0x1Fu) return std::bit_cast<float>(sign | 0x7F800000u | (man << 13));
+  return std::bit_cast<float>(sign | ((exp + 112u) << 23) | (man << 13));
+}
+
 DGPP_HD inline uint16_t float_to_bf16_bits(float f) {
   // Round-to-nearest-even. NaN needs an explicit path: the integer rounding
   // below assumes a finite exponent, but hardware NaN payloads (e.g. the

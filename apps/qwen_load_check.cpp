@@ -9,6 +9,8 @@
 //   qwen_load_check --model ORG/NAME | --checkpoint-dir DIR
 //                   [--world W] [--rank R] [--streaming] [--mtp]
 //                   [--layers N] [--image-dir DIR|off]
+//                   [--ngram-table resident|mmap] [--ngram-table-dir DIR]
+//                   [--dense-weights checkpoint|fp8]
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -24,7 +26,7 @@
 #include "models/qwen/loader.hpp"
 
 int main(int argc, char** argv) {
-  std::string model_id, ckpt, image_dir, ngram_table, dense_weights;
+  std::string model_id, ckpt, image_dir, ngram_table, dense_weights, ngram_table_dir;
   int world = 1, rank = 0, layers = -1;
   bool streaming = false, mtp = false;
   auto next = [&](int& i) -> std::string {
@@ -43,6 +45,7 @@ int main(int argc, char** argv) {
       else if (a == "--layers") layers = std::stoi(next(i));
       else if (a == "--image-dir") image_dir = next(i);
       else if (a == "--ngram-table") ngram_table = next(i);
+      else if (a == "--ngram-table-dir") ngram_table_dir = next(i);
       else if (a == "--dense-weights") dense_weights = next(i);
       else throw std::runtime_error("unknown argument " + a);
     }
@@ -58,6 +61,11 @@ int main(int argc, char** argv) {
     const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file(cfg_path);
     if (!image_dir.empty()) dgpp::QwenLayerStream::set_resident_image_dir(image_dir == "off" ? "" : image_dir);
     if (!ngram_table.empty()) dgpp::QwenLayerStream::set_ngram_table_mmap(ngram_table == "mmap");
+    if (!ngram_table_dir.empty())
+      dgpp::QwenLayerStream::set_ngram_table_dir(
+          std::filesystem::path(ngram_table_dir).is_absolute()
+              ? ngram_table_dir
+              : (std::filesystem::path(ckpt) / ngram_table_dir).string());
     if (!dense_weights.empty()) dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8");
     const dgpp::QwenResidency residency = streaming ? dgpp::QwenResidency::Streaming : dgpp::QwenResidency::Resident;
     const dgpp::QwenHeadSharding head = world > 1 ? dgpp::QwenHeadSharding::VocabSharded : dgpp::QwenHeadSharding::Full;
@@ -130,7 +138,9 @@ int main(int argc, char** argv) {
         DGPP_LOG_INFO("qwen_load_check: layer {} ({}{}) {:.3f} GiB in {:.2f} s, read {:.3f} GiB; experts {} x {} (scale block {}){}",
                       l, r.kind == dgpp::QwenLayerKind::Gdn ? "gdn" : "qsa", r.has_ple ? "+ple" : "",
                       r.bytes / kGiB, s, (stream.source_bytes_read() - before) / kGiB,
-                      r.moe.experts.size() / 3, r.moe.local_inter, r.moe.scale_block,
+                      (r.moe.experts.size() + r.moe.experts_fp4.size() +
+                       r.moe.experts_packed.size()) / 3,
+                      r.moe.local_inter, r.moe.scale_block,
                       r.has_ple ? std::format(", ple heads [{}, +{}) rows [{}, +{})", r.ple.hash_head_begin, r.ple.hash_heads, r.ple.row_begin, r.ple.rows) : "");
       if (!streaming) continue;
       stream.release_layer();

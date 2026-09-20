@@ -158,6 +158,19 @@ class ResidentLayerStream {
     return Geometry::from_config(cfg, rank, world, head).lm_vocab_count;
   }
 
+  // ---- companion shard directories -----------------------------------
+  // A release may ship one weight class beside the checkpoint rather than
+  // in it: the Qwen AutoRound build keeps its 48 GiB n-gram table in a
+  // `ple-table/` companion. Registering the directory brings ONLY the
+  // tensors whose name contains `name_filter` into the map, which is what
+  // makes it safe — that companion also carries its own copy of other
+  // layers' tensors, in other formats, and a blind scan would collide
+  // with the checkpoint's under the duplicate-tensor guard.
+  //
+  // Set before the stream is constructed; the registry is per family.
+  static void add_companion_dir(const std::string& dir, const std::string& name_filter);
+  static void clear_companion_dirs();
+
   void set_reader_stream(cudaStream_t reader) { reader_ = reader; }
   const Config& config() const { return cfg_; }
   const Geometry& geometry() const { return geo_; }
@@ -209,6 +222,9 @@ class ResidentLayerStream {
   void open_resident_image();
 
  private:
+  // The registered companions, (directory, name filter), per family.
+  static std::vector<std::pair<std::string, std::string>>& companion_dirs();
+
   struct CountedBuild {
     size_t bytes = 0;
     uint64_t source_bytes = 0;
@@ -257,6 +273,33 @@ ResidentLayerStream<F>::ResidentLayerStream(const Config& cfg, const std::string
     });
     shards_.push_back(std::move(f));
   }
+  for (const auto& [dir, filter] : companion_dirs()) {
+    if (!fs::is_directory(dir))
+      throw std::runtime_error(std::string(F::who()) + ": companion directory does not exist: " + dir);
+    std::vector<fs::path> paths;
+    for (const auto& entry : fs::directory_iterator(dir))
+      if (entry.path().extension() == ".safetensors") paths.push_back(entry.path());
+    std::sort(paths.begin(), paths.end());
+    size_t taken = 0;
+    for (const auto& path : paths) {
+      auto f = SafetensorsFile::open(path.string());
+      size_t here = 0;
+      f->for_each([&](const TensorInfo& t) {
+        if (t.name.find(filter) == std::string::npos) return;  // the companion's own copies
+        auto [it, inserted] = tensors_.emplace(t.name, &t);
+        if (!inserted)
+          throw std::runtime_error(std::string(F::who()) + ": companion tensor '" + t.name +
+                                   "' in " + path.string() + " is already in the checkpoint");
+        present.emplace(t.name, typename F::PresentMap::mapped_type{t.dtype, t.shape});
+        ++here;
+      });
+      taken += here;
+      if (here) shards_.push_back(std::move(f));  // the mapping must outlive the pointers
+    }
+    if (taken == 0)
+      throw std::runtime_error(std::string(F::who()) + ": companion directory " + dir +
+                               " holds no tensor matching '" + filter + "'");
+  }
   F::validate_binding(cfg_, present);
   F::check_sources(cfg_, tensors_);
 
@@ -281,6 +324,26 @@ ResidentLayerStream<F>::ResidentLayerStream(const Config& cfg, const std::string
   DGPP_CUDA_OK(cudaHostAlloc(&staging_, staging_bytes_, cudaHostAllocDefault));
   DGPP_CUDA_OK(cudaStreamCreate(&stream_));
   checkpoint_dir_ = checkpoint_dir;
+}
+
+template <class F>
+std::vector<std::pair<std::string, std::string>>& ResidentLayerStream<F>::companion_dirs() {
+  static std::vector<std::pair<std::string, std::string>> dirs;
+  return dirs;
+}
+
+template <class F>
+void ResidentLayerStream<F>::add_companion_dir(const std::string& dir,
+                                               const std::string& name_filter) {
+  if (dir.empty() || name_filter.empty())
+    throw std::runtime_error(std::string(F::who()) +
+                             ": a companion directory needs a path and a name filter");
+  companion_dirs().emplace_back(dir, name_filter);
+}
+
+template <class F>
+void ResidentLayerStream<F>::clear_companion_dirs() {
+  companion_dirs().clear();
 }
 
 template <class F>

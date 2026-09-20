@@ -110,6 +110,24 @@ struct QwenTextConfig {
   // e2m1 codes x e4m3 scales per 16 x an F32 per-tensor scale; the MTP
   // layer's experts stay FP8 block-128, the n-gram table FP8 as before.
   bool experts_nvfp4 = false;
+  // The AutoRound / auto-gptq W4A16 release: the backbone's routed experts
+  // and the lm_head as symmetric int4 codes under one F16 scale per 128
+  // elements along K (no zero points; the codes carry the 2^(bits-1)
+  // offset the engine's packed-int form already uses). The dense stack
+  // (attention, GDN, the shared experts, the PLE) stays the FP8 release's
+  // block-128 bytes and the MTP draft layer stays BF16.
+  bool experts_packed = false;
+  bool lm_head_packed = false;
+  // ...and this release ships the dense stack in the FP8 release's block
+  // form rather than BF16: the QSA projections, the GDN input/output
+  // projections and the shared experts are e4m3 + an F32 128x128 grid in
+  // the checkpoint. The indexer, in_proj_a/b, the routers, the norms, the
+  // PLE projections and the embedding stay BF16. Not declared by
+  // quantization_config (its rules only say what is NOT int4), so it rides
+  // with the release the way the n-gram table's form does.
+  bool dense_stack_fp8 = false;
+  int packed_bits = 4;
+  int packed_group = 128;
   bool ngram_table_fp8 = true;
 
   static QwenTextConfig parse(const minijson::Value& text_config,

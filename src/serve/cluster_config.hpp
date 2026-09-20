@@ -125,6 +125,10 @@ struct ClusterConfig {
     std::string stage_dir = "/tmp/bus4";     // where the launcher puts the peers' binary and config
     std::string release_dir = "~/dgpp/releases";
     std::string resident_cache;              // empty: the binary's default (~/.cache/dgpp/resident)
+    // Where the n-gram table's shards live when the release ships them
+    // beside the checkpoint rather than in it (the Qwen AutoRound build's
+    // `ple-table/`). Empty: in the checkpoint, as every other release.
+    std::string ngram_table_dir;
   } paths;
 
   int world() const { return static_cast<int>(nodes.size()); }

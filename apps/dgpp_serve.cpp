@@ -1056,6 +1056,7 @@ int main(int argc, char** argv) {
   int64_t http_max_body_bytes = dgpp::serve::kDefaultHttpMaxBodyBytes;
   std::string kv_dtype = "bf16";  // the latent cache's format
   std::string ngram_table = "resident";  // the Qwen n-gram table: resident | mmap
+  std::string ngram_table_dir;           // empty: the table is in the checkpoint
   std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8
   std::string bf16_weights = "checkpoint";  // the bf16 decode weights' resident form: checkpoint | bf12 | bf12+bf16
   std::string prefill = "bounded";  // the DeepSeek-V4.1 prefill: bounded | exact
@@ -1167,6 +1168,7 @@ int main(int argc, char** argv) {
     rendezvous_timeout_ms = e.rendezvous_timeout_ms;
     stats_interval_s = e.stats_interval_s;
     reasoning_in_content = e.reasoning_in_content;
+    if (!c.paths.ngram_table_dir.empty()) ngram_table_dir = c.paths.ngram_table_dir;
     // The resident image cache's directory, unless the environment says.
     if (!c.paths.resident_cache.empty())
       setenv("DGPP_RESIDENT_CACHE_DIR",
@@ -1195,6 +1197,7 @@ int main(int argc, char** argv) {
     else if (a == "--kv-capacity") kv_capacity = std::stoll(next());
     else if (a == "--kv-dtype") kv_dtype = next();
     else if (a == "--ngram-table") ngram_table = next();
+    else if (a == "--ngram-table-dir") ngram_table_dir = next();
     else if (a == "--dense-weights") dense_weights = next();
     else if (a == "--bf16-weights") bf16_weights = next();
     else if (a == "--prefill") prefill = next();
@@ -1462,6 +1465,17 @@ int main(int argc, char** argv) {
   // The Qwen n-gram table's residency: set before the plan and the load
   // (both read it; the table's bytes leave the plan under mmap).
   dgpp::QwenLayerStream::set_ngram_table_mmap(ngram_table == "mmap");
+  // The table's directory when the release ships it beside the checkpoint.
+  // A relative path is the checkpoint's own subdirectory, so a deployment
+  // config can say "ple-table" without knowing where the cache put the
+  // snapshot; the loader resolves the tensors before the plan is sized.
+  if (!ngram_table_dir.empty()) {
+    const std::string expanded = dgpp::serve::expand_home(ngram_table_dir);
+    dgpp::QwenLayerStream::set_ngram_table_dir(
+        std::filesystem::path(expanded).is_absolute()
+            ? expanded
+            : (std::filesystem::path(ckpt) / expanded).string());
+  }
   if (dense_weights != "checkpoint" && dense_weights != "fp8") {
     DGPP_LOG_ERROR("--dense-weights must be checkpoint or fp8, got '{}'", dense_weights);
     return 2;

@@ -99,8 +99,14 @@ struct QwenMoeResident {
   GlmQuantMatrix shared_fp8[3];           // dense_weights fp8: the same three
   std::vector<GlmQuantMatrix> experts;    // gate, up, down per expert (inter-sliced), the FP8 form
   std::vector<GlmFp4Matrix> experts_fp4;  // the same, the NVFP4 release's backbone experts
+  // The same again, the AutoRound release's backbone experts: the
+  // checkpoint's auto_gptq int4 codes transposed into the engine's packed
+  // form, one BF16 scale per 64 along K (the checkpoint's 128-group scale
+  // written to both halves).
+  std::vector<GlmPackedMatrix> experts_packed;
   float* expert_globals = nullptr;        // [E * 3] F32 on the device: 1 / weight_scale_2 per matrix
   bool nvfp4() const { return !experts_fp4.empty(); }
+  bool packq() const { return !experts_packed.empty(); }
   int64_t local_inter = 0;                // I/W
   int64_t local_shared_inter = 0;         // S/W
   int scale_block = 128;                  // gcd(128, I/W): the experts' sliced-axis scale grid
@@ -285,6 +291,15 @@ class QwenLayerStream : public ResidentLayerStream<QwenLoaderFamily> {
   static void set_dense_weights_fp8(bool on);
   static bool dense_weights_fp8();
   const QwenNgramTableMmap* ngram_mmap() const { return mmap_table_.get(); }
+
+  // The n-gram table's directory when the release ships it beside the
+  // checkpoint rather than in it (the AutoRound build's `ple-table/`):
+  // only the table's own tensors are taken from there, so the companion's
+  // copies of other layers' weights are ignored rather than colliding.
+  // Empty (the default) keeps the table in the checkpoint. Set before the
+  // stream is built; paths.ngram_table_dir drives it.
+  static void set_ngram_table_dir(const std::string& dir);
+  static const std::string& ngram_table_dir();
 
   static void set_resident_image_dir(const std::string& dir);
   static const std::string& resident_image_dir();

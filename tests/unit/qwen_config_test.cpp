@@ -49,6 +49,25 @@ const char* kQuant = R"({"quant_method": "fp8", "activation_scheme": "dynamic",
   "weight_per_tensor": false, "act_per_tensor": false, "weight_block_size": [128, 128],
   "modules_to_not_convert": ["lm_head"], "modules_to_convert": ["ple.ple_embedding.ngram_embedding"]})";
 
+// The AutoRound W4A16 release's quantization_config, transcribed
+// (azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound @ 0deb6480).
+const char* kQuantGptq = R"({"quant_method": "gptq", "bits": 4, "group_size": 128,
+  "desc_act": false, "sym": true, "lm_head": true,
+  "dynamic": {"+:.*lm_head$": {"bits": 4}, "-:.*linear_attn.*": {}, "-:.*self_attn.*": {},
+              "-:.*hyper_connection.*": {}, "-:.*visual.*": {}, "-:.*shared_expert.*": {},
+              "-:.*\\.ple\\..*": {}, "-:.*embed.*": {}, "-:.*fc_hidden.*": {},
+              "-:.*layers\\.48\\..*": {}, "-:.*\\.gate$": {}}})";
+
+// kQuantGptq with one JSON fragment swapped, for the refusals.
+std::string gptq_json(const std::string& from = "", const std::string& to = "") {
+  std::string s = kQuantGptq;
+  if (from.empty()) return s;
+  const size_t at = s.find(from);
+  require(at != std::string::npos, "gptq patch anchor missing: " + from);
+  s.replace(at, from.size(), to);
+  return s;
+}
+
 std::string layers_json() {
   std::string s;
   for (int i = 0; i < 48; ++i) {
@@ -206,4 +225,53 @@ DGPP_TEST(architecture_detection_names_the_families) {
     refused = true;
   }
   require(refused, "an unknown family is refused");
+}
+
+DGPP_TEST(qwen_config_parses_the_autoround_int4_release) {
+  const dgpp::QwenTextConfig c = parse(text_json(), kQuantGptq);
+  require(c.experts_packed && c.lm_head_packed, "the routed experts and the head are int4");
+  require(c.packed_bits == 4 && c.packed_group == 128, "int4 group 128");
+  require(!c.experts_fp8 && !c.experts_nvfp4, "the other two expert forms are off");
+  require(c.ngram_table_fp8, "the n-gram table stays the FP8 release's");
+  // The shape parse is the release's, unchanged by the weight format.
+  require(c.num_experts == 512 && c.mtp_layer() == 48, "the shape");
+}
+
+DGPP_TEST(qwen_config_refuses_the_int4_forms_the_loader_cannot_read) {
+  const std::string t = text_json();
+  require(refusal(t, gptq_json("\"bits\": 4", "\"bits\": 8")).find("quantization_config.bits") !=
+              std::string::npos,
+          "int8 codes are refused by name");
+  require(refusal(t, gptq_json("\"group_size\": 128", "\"group_size\": 32"))
+                  .find("quantization_config.group_size") != std::string::npos,
+          "a group the packed form cannot express is refused by name");
+  require(refusal(t, gptq_json("\"sym\": true", "\"sym\": false"))
+                  .find("quantization_config.sym") != std::string::npos,
+          "asymmetric codes are refused by name");
+  require(refusal(t, gptq_json("\"desc_act\": false", "\"desc_act\": true"))
+                  .find("quantization_config.desc_act") != std::string::npos,
+          "activation order is refused by name");
+}
+
+DGPP_TEST(qwen_config_refuses_an_int4_rule_list_that_is_not_the_contract) {
+  const std::string t = text_json();
+  // A release that also quantizes the attention projections: the rule is
+  // gone, so the loader would read int4 tensors as BF16.
+  const std::string dropped = refusal(t, gptq_json(", \"-:.*self_attn.*\": {}", ""));
+  require(dropped.find("quantization_config.dynamic") != std::string::npos &&
+              dropped.find("self_attn") != std::string::npos,
+          "a missing exclusion is refused, naming the module");
+  // A rule the loader has never seen must not be silently ignored.
+  const std::string extra =
+      refusal(t, gptq_json("\"-:.*visual.*\": {}", "\"-:.*visual.*\": {}, \"-:.*q_norm.*\": {}"));
+  require(extra.find("quantization_config.dynamic") != std::string::npos &&
+              extra.find("q_norm") != std::string::npos,
+          "an unknown rule is refused, naming it");
+  // The draft layer's exclusion is derived from num_hidden_layers, not a
+  // constant: dropping it names the rule the parser expected to find.
+  const std::string draft =
+      refusal(t, gptq_json("\"-:.*layers\\\\.48\\\\..*\": {}, ", ""));
+  require(draft.find("quantization_config.dynamic") != std::string::npos &&
+              draft.find("layers\\.48\\.") != std::string::npos,
+          "the draft layer's exclusion is checked against num_hidden_layers");
 }

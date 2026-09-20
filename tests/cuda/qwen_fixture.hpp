@@ -6,6 +6,7 @@
 // magnitudes that keep the forward's nonlinearities informative; the
 // n-gram hash buffers are the config's derivation (the loader refuses
 // anything else) and the table shards follow the checkpoint's row split.
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -74,6 +75,54 @@ inline const char* tiny_nvfp4_quant_json() {
     "num_bits":4,"type":"float","group_size":16}}}})json";
 }
 
+// The AutoRound W4A16 release's shape: int4 routed experts and head, a BF16
+// draft layer. The rule list is the real one with the draft layer's index
+// taken from this config (4 rather than 48). The intermediate widens to 128
+// so that down_proj's K carries whole 128-element groups — the real
+// checkpoint's 640 does, and 64 would not.
+inline const char* tiny_gptq_quant_json() {
+  return R"json({"quant_method": "gptq", "bits": 4, "group_size": 128,
+  "desc_act": false, "sym": true, "lm_head": true,
+  "dynamic": {"+:.*lm_head$": {"bits": 4}, "-:.*linear_attn.*": {}, "-:.*self_attn.*": {},
+              "-:.*hyper_connection.*": {}, "-:.*visual.*": {}, "-:.*shared_expert.*": {},
+              "-:.*\\.ple\\..*": {}, "-:.*embed.*": {}, "-:.*fc_hidden.*": {},
+              "-:.*layers\\.4\\..*": {}, "-:.*\\.gate$": {}}})json";
+}
+
+inline std::string tiny_gptq_text_json() {
+  std::string t = tiny_text_json();
+  const std::string from = "\"moe_intermediate_size\": 64";
+  const size_t at = t.find(from);
+  if (at == std::string::npos) throw std::runtime_error("fixture: moe_intermediate_size anchor");
+  t.replace(at, from.size(), "\"moe_intermediate_size\": 128");
+  return t;
+}
+
+inline QwenTextConfig tiny_gptq_config() {
+  const std::string text = tiny_gptq_text_json();
+  const auto t = dgpp::minijson::parse(text);
+  const auto q = dgpp::minijson::parse(tiny_gptq_quant_json());
+  return QwenTextConfig::parse(t.root, &q.root);
+}
+
+// float -> IEEE binary16, round-to-nearest-even. Test-side only: the engine
+// reads F16 and never writes it (common/dtypes.hpp has the other direction).
+inline uint16_t float_to_f16_bits(float f) {
+  const uint32_t u = std::bit_cast<uint32_t>(f);
+  const uint32_t sign = (u >> 16) & 0x8000u;
+  int32_t exp = static_cast<int32_t>((u >> 23) & 0xFFu) - 127 + 15;
+  uint32_t man = u & 0x7FFFFFu;
+  if (exp >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00u);
+  if (exp <= 0) return static_cast<uint16_t>(sign);  // flush the subnormals
+  const uint32_t rounded = man + 0x0FFFu + ((man >> 13) & 1u);
+  if (rounded & 0x800000u) {
+    ++exp;
+    if (exp >= 0x1F) return static_cast<uint16_t>(sign | 0x7C00u);
+  }
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
+                               ((rounded >> 13) & 0x3FFu));
+}
+
 inline QwenTextConfig tiny_config() {
   const auto t = dgpp::minijson::parse(tiny_text_json());
   const auto q = dgpp::minijson::parse(tiny_quant_json());
@@ -107,6 +156,23 @@ inline std::vector<uint8_t> tensor_bytes(const QwenTextConfig& cfg, const QwenEx
   }
   Rng rng(seed_for(name));
   const size_t n = e.numel();
+  // The auto_gptq triple: random codes, real F16 scales, and the constant
+  // zero point symmetric quantization writes (the loader rejects any other).
+  if (e.role == QwenTensorRole::PackedWords || e.role == QwenTensorRole::PackedZeros) {
+    for (size_t i = 0; i < n; ++i) {
+      const uint32_t w =
+          e.role == QwenTensorRole::PackedZeros ? 0x77777777u : rng.next();
+      std::memcpy(&out[i * 4], &w, 4);
+    }
+    return out;
+  }
+  if (e.role == QwenTensorRole::PackedScale) {
+    for (size_t i = 0; i < n; ++i) {
+      const uint16_t bits = float_to_f16_bits(0.004f + 0.02f * (0.5f * (rng.unit() + 1.0f)));
+      std::memcpy(&out[i * 2], &bits, 2);
+    }
+    return out;
+  }
   const bool is_norm = has(name, "norm") && e.shape.size() == 1;  // the (1+w) norms: w near 0
   const bool is_gdn_norm = has(name, "linear_attn.norm.weight");   // plain w near 1
   const bool is_scale_inv = has(name, "_scale_inv");

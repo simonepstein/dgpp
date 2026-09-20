@@ -356,8 +356,96 @@ QwenTextConfig QwenTextConfig::parse(const minijson::Value& tc,
       c.ngram_table_fp8 = false;
       return c;
     }
+    // The AutoRound W4A16 release (2026-09-20,
+    // azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound) declares itself
+    // as gptq in the auto_gptq v1 layout: `qweight` I32 [K/8, N] packed
+    // along K with the low nibble the lowest k, `scales` F16 [K/group, N],
+    // and `qzeros` a constant (sym) — so every code carries the same
+    // 2^(bits-1) offset the engine's packed-int form uses, and the word a
+    // group of 8 k's packs into is bit-identical to the engine's
+    // (models/quant_matrix.hpp). Which module is int4 comes from
+    // auto-round's `dynamic` rule list rather than a module name array;
+    // the rules are checked against the one contract the loader
+    // implements — the backbone's routed experts and the lm_head int4,
+    // everything else left in the FP8 release's form.
+    if (method == "gptq" || method == "auto-round") {
+      const auto qfail = [](const std::string& field, const std::string& why) {
+        throw std::runtime_error("Qwen quantization_config." + field + ": " + why);
+      };
+      if (const int bits = optional_int(q, "bits", 0); bits != 4)
+        qfail("bits", "only int4 is implemented, got " + std::to_string(bits));
+      const int group = optional_int(q, "group_size", 0);
+      if (group != 128)
+        qfail("group_size", "only group 128 is implemented, got " + std::to_string(group));
+      if (!optional_bool(q, "sym", false))
+        qfail("sym", "only the symmetric form is implemented (asymmetric codes need a "
+                     "per-group zero point the packed-int kernels do not carry)");
+      if (optional_bool(q, "desc_act", false))
+        qfail("desc_act", "activation-order quantization is not implemented (its g_idx "
+                          "permutes K, which the group-contiguous packed form cannot express)");
+      const minijson::Value* dyn = q.find("dynamic");
+      if (dyn == nullptr || !dyn->is_object())
+        qfail("dynamic", "missing — the engine reads auto-round's rule list to know which "
+                         "modules are int4");
+      // The rules the loader implements, verbatim: one `+:` for the head and
+      // the `-:` exclusions that leave the dense stack, the routers and the
+      // draft layer (index num_hidden_layers) alone.
+      const std::string head_rule = "+:.*lm_head$";
+      const std::string mtp_rule =
+          "-:.*layers\\." + std::to_string(c.num_hidden_layers) + "\\..*";
+      const std::vector<std::string> dense_rules = {
+          "-:.*linear_attn.*", "-:.*self_attn.*", "-:.*hyper_connection.*",
+          "-:.*visual.*",      "-:.*shared_expert.*", "-:.*\\.ple\\..*",
+          "-:.*embed.*",       "-:.*fc_hidden.*",     "-:.*\\.gate$"};
+      std::vector<bool> seen(dense_rules.size(), false);
+      bool head_seen = false, mtp_seen = false;
+      for (const auto& m : dyn->members()) {
+        if (m.key == head_rule) {
+          head_seen = true;
+          continue;
+        }
+        if (m.key == mtp_rule) {
+          mtp_seen = true;
+          continue;
+        }
+        size_t i = 0;
+        for (; i < dense_rules.size(); ++i)
+          if (m.key == dense_rules[i]) break;
+        if (i == dense_rules.size())
+          qfail("dynamic", "rule '" + m.key +
+                               "' is not one the loader implements (the contract is: the "
+                               "routed experts and the lm_head int4, the rest dense)");
+        seen[i] = true;
+      }
+      for (size_t i = 0; i < dense_rules.size(); ++i)
+        if (!seen[i])
+          qfail("dynamic", "rule '" + dense_rules[i] +
+                               "' is missing — the loader keeps that module dense and would "
+                               "read its int4 tensors as BF16");
+      if (!mtp_seen)
+        qfail("dynamic", "rule '" + mtp_rule +
+                             "' is missing — the MTP draft layer must stay BF16");
+      if (!head_seen)
+        qfail("dynamic", "rule '" + head_rule +
+                             "' is missing — the engine has no BF16 lm_head in this release");
+      c.experts_fp8 = false;
+      c.experts_nvfp4 = false;
+      c.experts_packed = true;
+      c.lm_head_packed = true;
+      c.dense_stack_fp8 = true;
+      c.packed_bits = 4;
+      c.packed_group = group;
+      // The dense stack is the FP8 release's bytes, the n-gram table
+      // included (the release ships it as the companion e4m3 table with one
+      // BF16 per-tensor scale); the loader checks the dtypes it finds.
+      c.ngram_table_fp8 = true;
+      (void)c.ngram_geometry();
+      return c;
+    }
     if (method != "fp8")
-      throw std::runtime_error("Qwen quantization_config.quant_method: only fp8 is implemented, got '" + method + "'");
+      throw std::runtime_error(
+          "Qwen quantization_config.quant_method: only fp8, gptq/auto-round (int4) and the "
+          "NVFP4 config_groups form are implemented, got '" + method + "'");
     const std::vector<int64_t> bs = require_int_array(q, "weight_block_size");
     if (bs.size() != 2 || bs[0] != 128 || bs[1] != 128)
       throw std::runtime_error("Qwen quantization_config.weight_block_size: only [128, 128] is implemented");

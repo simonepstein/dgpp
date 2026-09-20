@@ -97,7 +97,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
     "engine": {"max_concurrency": 2, "decode_graph": true, "prefix_cache_gib": 0.5,
                "admission": "grow", "stats_interval_s": 0, "mtp_depth": 2, "prefill": "exact",
                "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048},
-    "paths": {"log_dir": "/var/log/dgpp"}
+    "paths": {"log_dir": "/var/log/dgpp", "ngram_table_dir": "ple-table"}
   })";
   const dgpp::serve::ClusterConfig c = dgpp::serve::parse_cluster_config(json, "t");
   require(c.model == "org/name" && c.world() == 3 && c.nodes[0] == "10.0.0.1" &&
@@ -133,6 +133,8 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   require(c.paths.log_dir == "/var/log/dgpp" && c.paths.stage_dir == "/tmp/bus4" &&
               c.paths.release_dir == "~/dgpp/releases" && c.paths.resident_cache.empty(),
           "the paths: given one taken, the rest defaulted");
+  require(c.paths.ngram_table_dir == "ple-table",
+          "the n-gram table's companion directory (relative: the checkpoint's own)");
   // A one-node config is a world of one.
   const dgpp::serve::ClusterConfig one =
       dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t");

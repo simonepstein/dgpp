@@ -760,9 +760,11 @@ struct WeightBuilder {
     note_read(eg, 4);
   }
 
- private:
+ protected:
   // `count` scale entries from element `index` of the source grid into
-  // `dst` as F32 — memcpy for an F32 source, widened for BF16.
+  // `dst` as F32 — memcpy for an F32 source, widened for BF16. Derived
+  // builders that assemble a quantized matrix from several row ranges of
+  // one source (the Qwen GDN's [q | k | v] stack) go through it too.
   void copy_scale_row(const TensorInfo& ts, int64_t index, int64_t count, float* dst) const {
     if (ts.dtype == DType::F32) {
       std::memcpy(dst, static_cast<const float*>(ts.data) + index,

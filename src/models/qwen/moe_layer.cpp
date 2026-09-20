@@ -37,6 +37,7 @@ GlmMoeWeights QwenMoeLayer::routed_view(const QwenMoeWeights& w) {
   g.router_bias = nullptr;
   g.experts = w.experts;
   g.experts_fp4 = w.experts_fp4;
+  g.experts_packed = w.experts_packed;
   return g;
 }
 
@@ -88,10 +89,13 @@ QwenMoeLayer::~QwenMoeLayer() {
 void QwenMoeLayer::check_weights() const {
   const bool shared_ok = w_.shared_fp8 ? (w_.shared_fp8[0].payload && w_.shared_fp8[1].payload && w_.shared_fp8[2].payload)
                                        : (w_.shared_gate_proj && w_.shared_up_proj && w_.shared_down_proj);
-  if (!w_.router || !w_.shared_gate || !shared_ok || (!w_.experts && !w_.experts_fp4))
+  const int formats = (w_.experts != nullptr) + (w_.experts_fp4 != nullptr) +
+                      (w_.experts_packed != nullptr);
+  if (!w_.router || !w_.shared_gate || !shared_ok || formats == 0)
     throw std::invalid_argument("QwenMoeLayer: null weight pointer");
-  if (w_.experts && w_.experts_fp4)
-    throw std::invalid_argument("QwenMoeLayer: both fp8 and nvfp4 experts bound");
+  if (formats != 1)
+    throw std::invalid_argument(
+        "QwenMoeLayer: exactly one of the fp8, nvfp4 and packed-int expert forms must be bound");
   if (w_.shared_inter <= 0 || w_.shared_inter % 8 != 0)
     throw std::invalid_argument("QwenMoeLayer: shared_inter must be a positive multiple of 8");
   if (cfg_.hidden % 8 != 0)

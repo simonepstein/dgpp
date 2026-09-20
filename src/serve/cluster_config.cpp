@@ -297,6 +297,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         else if (p.key == "stage_dir") c.paths.stage_dir = text(p.value, pk, what);
         else if (p.key == "release_dir") c.paths.release_dir = text(p.value, pk, what);
         else if (p.key == "resident_cache") c.paths.resident_cache = text(p.value, pk, what);
+        else if (p.key == "ngram_table_dir") c.paths.ngram_table_dir = text(p.value, pk, what);
         else fail(what, "unknown key '" + pk + "'");
       }
     } else {

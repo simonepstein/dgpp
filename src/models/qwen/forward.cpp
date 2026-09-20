@@ -345,6 +345,7 @@ QwenMoeWeights QwenModel::moe_view(const QwenMoeResident& m) {
   w.shared_inter = m.local_shared_inter;
   w.experts = m.experts.empty() ? nullptr : m.experts.data();
   w.experts_fp4 = m.experts_fp4.empty() ? nullptr : m.experts_fp4.data();
+  w.experts_packed = m.experts_packed.empty() ? nullptr : m.experts_packed.data();
   return w;
 }
 
