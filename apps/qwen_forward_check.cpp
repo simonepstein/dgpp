@@ -8,6 +8,8 @@
 //                      --ids 1,2,3,... [--topk K] [--layers N] [--dump-states FILE]
 //                      [--world W --rank R --peer HOST --port N] [--resident]
 //                      [--image-dir DIR|off] [--lat-slot-bytes N]
+//                      [--ngram-table resident|mmap] [--ngram-table-dir DIR]
+//                      [--dense-weights checkpoint|fp8]
 //
 // TP (plan D1): one process per node over the fabric bus; every fold of
 // the diagnostic forward rides the latency path, so the slot is sized for
@@ -40,7 +42,8 @@
 #include "models/qwen/forward.hpp"
 
 int main(int argc, char** argv) {
-  std::string model_id, ckpt, ids_text, dump_states, peer, image_dir, ngram_table, dense_weights;
+  std::string model_id, ckpt, ids_text, dump_states, peer, image_dir, ngram_table, dense_weights,
+      ngram_table_dir;
   int topk = 5, layers = -1, world = 1, rank = 0, port = 29950;
   bool resident = false;
   size_t lat_slot_bytes = 0;
@@ -64,6 +67,7 @@ int main(int argc, char** argv) {
       else if (a == "--resident") resident = true;
       else if (a == "--image-dir") image_dir = next(i);
       else if (a == "--ngram-table") ngram_table = next(i);
+      else if (a == "--ngram-table-dir") ngram_table_dir = next(i);
       else if (a == "--dense-weights") dense_weights = next(i);
       else if (a == "--lat-slot-bytes") lat_slot_bytes = std::stoull(next(i));
       else throw std::runtime_error("unknown argument " + a);
@@ -93,6 +97,11 @@ int main(int argc, char** argv) {
     const int H = cfg.hidden_size, W = cfg.hc_count * H;
     if (!image_dir.empty()) dgpp::QwenLayerStream::set_resident_image_dir(image_dir == "off" ? "" : image_dir);
     if (!ngram_table.empty()) dgpp::QwenLayerStream::set_ngram_table_mmap(ngram_table == "mmap");
+    if (!ngram_table_dir.empty())
+      dgpp::QwenLayerStream::set_ngram_table_dir(
+          std::filesystem::path(ngram_table_dir).is_absolute()
+              ? ngram_table_dir
+              : (std::filesystem::path(ckpt) / ngram_table_dir).string());
     if (!dense_weights.empty()) dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8");
     const dgpp::QwenResidency residency = resident ? dgpp::QwenResidency::Resident : dgpp::QwenResidency::Streaming;
     DGPP_LOG_INFO("qwen_forward_check: {} — {} tokens, {} layers, {} world {} rank {}", ckpt, T,
