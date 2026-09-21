@@ -743,6 +743,30 @@ int prefix_arena_slots(size_t bytes, double gib) {
 // release whose tokenizer.json disagrees with the vocab it ships is the
 // case this exists for; only tokenizer.json moves, so the chat template
 // and everything else still come from the checkpoint.
+// The chat template to render with: the checkpoint's own, or the one
+// `which` names — a bare name picks <ckpt>/<name>_chat_template.jinja (then
+// <ckpt>/<name>), anything with a separator is a path. A release may ship
+// several, and which one the speculative head was trained on shows up in
+// how many drafted tokens the model accepts.
+std::string resolve_chat_template(const std::string& ckpt, const std::string& which) {
+  const fs::path stock = fs::path(ckpt) / "chat_template.jinja";
+  if (which.empty() || which == "model") return stock.string();
+  const std::string expanded = dgpp::serve::expand_home(which);
+  if (expanded.find('/') != std::string::npos) {
+    if (fs::is_regular_file(expanded)) return expanded;
+    throw std::runtime_error("chat_template '" + which + "': no such file");
+  }
+  for (const fs::path candidate : {fs::path(ckpt) / (expanded + "_chat_template.jinja"),
+                                   fs::path(ckpt) / expanded})
+    if (fs::is_regular_file(candidate)) return candidate.string();
+  std::string shipped;
+  for (const auto& entry : fs::directory_iterator(ckpt))
+    if (entry.path().filename().string().find("chat_template") != std::string::npos)
+      shipped += (shipped.empty() ? "" : ", ") + entry.path().filename().string();
+  throw std::runtime_error("chat_template '" + which + "': not in the checkpoint (it ships " +
+                           (shipped.empty() ? "none" : shipped) + ")");
+}
+
 std::string resolve_tokenizer_json(const std::string& ckpt, const std::string& from) {
   if (from.empty()) return (fs::path(ckpt) / "tokenizer.json").string();
   const std::string expanded = dgpp::serve::expand_home(from);
@@ -765,7 +789,7 @@ std::string resolve_tokenizer_json(const std::string& ckpt, const std::string& f
 
 int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
                  const std::vector<int64_t>& eos_ids, const std::string& ckpt,
-                 const std::string& tokenizer_json,
+                 const std::string& tokenizer_json, const std::string& chat_template,
                  const std::string& model_display, const ServeKnobs& k,
                  bool no_eos, double boot_s,
                  dgpp::serve::JournalWriter* journal,
@@ -792,9 +816,10 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
     DGPP_LOG_INFO("serve: tokenizer {:#x}, the DeepSeek-V4.1 prompt renderer {:#x}", tok.revision_hash(),
                   template_hash);
   } else {
-    tpl.emplace(dgpp::text::ChatTemplate::load((fs::path(ckpt) / "chat_template.jinja").string()));
+    tpl.emplace(dgpp::text::ChatTemplate::load(chat_template));
     template_hash = tpl->source_hash();
-    DGPP_LOG_INFO("serve: tokenizer {:#x}, template {:#x} loaded", tok.revision_hash(), template_hash);
+    DGPP_LOG_INFO("serve: tokenizer {:#x}, template {:#x} loaded ({})", tok.revision_hash(),
+                  template_hash, fs::path(chat_template).filename().string());
     if (family_name == "glm5" && engine->supports_images())
       frontend = std::make_unique<dgpp::serve::GlmVisionFrontend>(&tok, &*tpl);
     else
@@ -1094,6 +1119,7 @@ int main(int argc, char** argv) {
   std::string ngram_table = "resident";  // the Qwen n-gram table: resident | mmap
   std::string ngram_table_dir;           // empty: the table is in the checkpoint
   std::string tokenizer_from;            // empty: tokenizer.json from the checkpoint
+  std::string chat_template;             // empty: the checkpoint's chat_template.jinja
   std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8
   std::string bf16_weights = "checkpoint";  // the bf16 decode weights' resident form: checkpoint | bf12 | bf12+bf16
   std::string prefill = "bounded";  // the DeepSeek-V4.1 prefill: bounded | exact
@@ -1210,6 +1236,7 @@ int main(int argc, char** argv) {
       model_id += "@" + c.revision;
     if (!e.ngram_table_dir.empty()) ngram_table_dir = e.ngram_table_dir;
     if (!e.tokenizer_from.empty()) tokenizer_from = e.tokenizer_from;
+    if (!e.chat_template.empty()) chat_template = e.chat_template;
     // The resident image cache's directory, unless the environment says.
     if (!c.paths.resident_cache.empty())
       setenv("DGPP_RESIDENT_CACHE_DIR",
@@ -1240,6 +1267,7 @@ int main(int argc, char** argv) {
     else if (a == "--ngram-table") ngram_table = next();
     else if (a == "--ngram-table-dir") ngram_table_dir = next();
     else if (a == "--tokenizer-from") tokenizer_from = next();
+    else if (a == "--chat-template") chat_template = next();
     else if (a == "--dense-weights") dense_weights = next();
     else if (a == "--bf16-weights") bf16_weights = next();
     else if (a == "--prefill") prefill = next();
@@ -2165,6 +2193,7 @@ int main(int argc, char** argv) {
         open_ops_file(&oplog, "serve_rank0.ops");
         const int rc = serve_openai(engine_ptr(), family->vocab_size(), family->eos_token_ids(), ckpt,
                                     resolve_tokenizer_json(ckpt, tokenizer_from),
+                                    resolve_chat_template(ckpt, chat_template),
                                     model_display, knobs, no_eos, boot_s(), journal ? &*journal : nullptr, &oplog,
                                     family->name());
         engine_release();
@@ -2209,6 +2238,7 @@ int main(int argc, char** argv) {
         &grammar_vocab, prefix_slots);
     const int rc = serve_openai(engine.get(), family->vocab_size(), family->eos_token_ids(), ckpt,
                                     resolve_tokenizer_json(ckpt, tokenizer_from),
+                                    resolve_chat_template(ckpt, chat_template),
                                 model_display, knobs, no_eos, boot_s(), /*journal=*/nullptr,
                                 /*oplog=*/nullptr, family->name());
     engine.reset();

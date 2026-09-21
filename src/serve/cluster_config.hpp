@@ -70,6 +70,13 @@ struct ClusterConfig {
     // other release. Only tokenizer.json moves; the chat template and the
     // rest still come from the checkpoint.
     std::string tokenizer_from;
+    // Which chat template to render prompts with. A release may ship
+    // several: the AutoRound build's speculative head was trained on its
+    // `medium` one, which accepts measurably more drafted tokens than the
+    // stock template. A bare name picks <ckpt>/<name>_chat_template.jinja
+    // (then <ckpt>/<name>); a path is taken as given. Empty: the
+    // checkpoint's own chat_template.jinja, as every other release.
+    std::string chat_template;
     // The Qwen dense stack's form: "checkpoint" (the default:
     // the BF16 the checkpoint ships) or "fp8" (every dense projection
     // encoded to block FP8 at load — the same recipe as the FP8 releases;

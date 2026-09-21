@@ -175,6 +175,7 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
         }
         else if (p.key == "ngram_table_dir") e.ngram_table_dir = text(x, ek, what);
         else if (p.key == "tokenizer_from") e.tokenizer_from = text(x, ek, what);
+        else if (p.key == "chat_template") e.chat_template = text(x, ek, what);
         else if (p.key == "ngram_table") {
           e.ngram_table = text(x, ek, what);
           if (e.ngram_table != "resident" && e.ngram_table != "mmap")
