@@ -46,6 +46,15 @@
 
 namespace dgpp {
 
+// The MTP draft layer's shared-expert width, read from the checkpoint's own
+// head tensor (mtp.layers.0.mlp.shared_expert.gate_proj.weight, rows). A
+// release may widen the backbone's shared expert and leave the speculative
+// head's alone, which one transformers config key cannot describe; the
+// upstream serving tooling reads the head file for the same reason.
+// Returns 0 when the checkpoint has no draft head or does not say, which
+// leaves the head on the model's own width.
+int qwen_probe_mtp_shared_inter(const std::string& checkpoint_dir);
+
 using QwenResidency = LoaderResidency;
 using QwenHeadSharding = LoaderHeadSharding;
 using QwenReplicatedDigest = ReplicatedDigest;

@@ -257,7 +257,11 @@ struct QwenLoaderFamily::Builder : WeightBuilder<QwenExpectedTensor> {
     QwenMoeResident& m = out.moe;
     m.router = load_bf16(p + "gate.weight");
     m.shared_gate = load_bf16(p + "shared_expert_gate.weight");
-    const int64_t S = geo.local_shared_inter, I = geo.local_inter;
+    // The draft layer's shared expert may be narrower than the stack's; it
+    // slices on the same rule (S/world), from its own S.
+    const bool draft = out.layer == cfg.mtp_layer();
+    const int64_t S = draft ? cfg.draft_shared_inter() / world : geo.local_shared_inter;
+    const int64_t I = geo.local_inter;
     const int64_t r = rank;
     m.local_inter = I;
     m.local_shared_inter = S;
@@ -723,6 +727,27 @@ QwenLocalGeometry QwenLocalGeometry::from_config(const QwenTextConfig& cfg, int 
     g.lm_vocab_count = cfg.vocab_size;
   }
   return g;
+}
+
+int qwen_probe_mtp_shared_inter(const std::string& checkpoint_dir) {
+  namespace fs = std::filesystem;
+  const std::string want = "mtp.layers.0.mlp.shared_expert.gate_proj.weight";
+  std::error_code ec;
+  for (const auto& entry : fs::directory_iterator(checkpoint_dir, ec)) {
+    if (entry.path().extension() != ".safetensors") continue;
+    std::unique_ptr<SafetensorsFile> f;
+    try {
+      f = SafetensorsFile::open(entry.path().string());
+    } catch (const std::exception&) {
+      continue;  // a shard we cannot map tells us nothing about the head
+    }
+    int rows = 0;
+    f->for_each([&](const TensorInfo& t) {
+      if (t.name == want && t.shape.size() == 2) rows = static_cast<int>(t.shape[0]);
+    });
+    if (rows > 0) return rows;
+  }
+  return 0;
 }
 
 // ---- the family hooks (loaders/resident_stream.hpp) -------------------------

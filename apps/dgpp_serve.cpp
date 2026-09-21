@@ -385,6 +385,14 @@ struct QwenFamily final : ServeFamily {
           rope_scaling->beta_fast, rope_scaling->beta_slow, rope_scaling->attn_factor,
           static_cast<double>(rope_scaling->mscale()), cfg.context_limit());
     }
+
+    // A release may leave the draft head's shared expert narrower than the
+    // stack's — the AutoRound build's healed revision does — and
+    // config.json has one key for both. The head's own tensor says.
+    cfg.mtp_shared_expert_inter = dgpp::qwen_probe_mtp_shared_inter(checkpoint);
+    if (cfg.mtp_shared_expert_inter != cfg.shared_expert_intermediate_size)
+      DGPP_LOG_INFO("serve: the draft head's shared expert is {} wide, the stack's {}",
+                    cfg.mtp_shared_expert_inter, cfg.shared_expert_intermediate_size);
   }
   const char* name() const override { return "qwen4_exp"; }
   int64_t vocab_size() const override { return cfg.vocab_size; }

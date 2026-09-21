@@ -89,6 +89,9 @@ int main(int argc, char** argv) {
     if (dgpp::detect_architecture_file(cfg_path) != dgpp::ModelArchitecture::Qwen4Exp)
       throw std::runtime_error("not a Qwen4Exp checkpoint: " + ckpt);
     dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file(cfg_path);
+    // A release may leave the draft head's shared expert narrower than the
+    // stack's; config.json cannot say so, the head's own tensor can.
+    cfg.mtp_shared_expert_inter = dgpp::qwen_probe_mtp_shared_inter(ckpt);
     if (layers > 0 && layers < cfg.num_hidden_layers) {
       cfg.num_hidden_layers = layers;
       cfg.layers.resize(static_cast<size_t>(layers));

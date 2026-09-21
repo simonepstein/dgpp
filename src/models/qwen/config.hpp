@@ -85,6 +85,19 @@ struct QwenTextConfig {
   int num_experts_per_tok = 10;
   int moe_intermediate_size = 640;
   int shared_expert_intermediate_size = 640;
+  // The MTP draft layer's own shared expert, when it differs from the
+  // stack's. A release may widen the backbone's shared expert without
+  // touching the speculative head — the AutoRound build's 2026-09 revision
+  // healed the k=5 cut by doubling the model's to 1280 and left the head's
+  // at 640 — and one transformers config key cannot describe both. 0: the
+  // head shares the model's width, as every other release. Not declared in
+  // config.json; qwen_probe_mtp_shared_inter() reads it off the head's own
+  // tensor, which is what the upstream serving tooling does.
+  int mtp_shared_expert_inter = 0;
+  int draft_shared_inter() const {
+    return mtp_shared_expert_inter > 0 ? mtp_shared_expert_inter
+                                       : shared_expert_intermediate_size;
+  }
   bool norm_topk_prob = true;
 
   // --- n-gram embedding (PLE) -------------------------------------------

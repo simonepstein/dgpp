@@ -121,7 +121,9 @@ void expect_moe(TensorList& out, const std::string& p, const QwenTextConfig& cfg
   const int64_t H = cfg.hidden_size;
   add_bf16(out, p + "gate.weight", {cfg.num_experts, H}, QwenWeightClass::Router, layer);
   add_bf16(out, p + "shared_expert_gate.weight", {1, H}, QwenWeightClass::Router, layer);
-  const int64_t S = cfg.shared_expert_intermediate_size;
+  // The draft layer's shared expert may be narrower than the stack's.
+  const int64_t S = layer == cfg.mtp_layer() ? cfg.draft_shared_inter()
+                                             : cfg.shared_expert_intermediate_size;
   const bool dense_fp8 = cfg.dense_stack_fp8 && layer != cfg.mtp_layer();
   const QwenWeightClass sc = QwenWeightClass::SharedExpert;
   add_dense(out, dense_fp8, p + "shared_expert.gate_proj.weight", S, H, sc, layer);

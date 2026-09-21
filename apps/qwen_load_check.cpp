@@ -58,7 +58,10 @@ int main(int argc, char** argv) {
     const std::string cfg_path = (std::filesystem::path(ckpt) / "config.json").string();
     if (dgpp::detect_architecture_file(cfg_path) != dgpp::ModelArchitecture::Qwen4Exp)
       throw std::runtime_error("not a Qwen4Exp checkpoint: " + ckpt);
-    const dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file(cfg_path);
+    dgpp::QwenTextConfig cfg = dgpp::QwenTextConfig::from_json_file(cfg_path);
+    // A release may leave the draft head's shared expert narrower than the
+    // stack's; config.json cannot say so, the head's own tensor can.
+    cfg.mtp_shared_expert_inter = dgpp::qwen_probe_mtp_shared_inter(ckpt);
     if (!image_dir.empty()) dgpp::QwenLayerStream::set_resident_image_dir(image_dir == "off" ? "" : image_dir);
     if (!ngram_table.empty()) dgpp::QwenLayerStream::set_ngram_table_mmap(ngram_table == "mmap");
     if (!ngram_table_dir.empty())
