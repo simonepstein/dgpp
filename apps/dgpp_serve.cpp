@@ -737,14 +737,50 @@ int prefix_arena_slots(size_t bytes, double gib) {
   return static_cast<int>(std::min(slots, 4096.0));
 }
 
+// tokenizer.json: the checkpoint's, or the one `from` names — a path
+// (file or directory; absolute, ~-expanded, or relative to the checkpoint)
+// or a cached Hub model id, optionally org/name@revision. A repackaged
+// release whose tokenizer.json disagrees with the vocab it ships is the
+// case this exists for; only tokenizer.json moves, so the chat template
+// and everything else still come from the checkpoint.
+std::string resolve_tokenizer_json(const std::string& ckpt, const std::string& from) {
+  if (from.empty()) return (fs::path(ckpt) / "tokenizer.json").string();
+  const std::string expanded = dgpp::serve::expand_home(from);
+  const fs::path as_path =
+      fs::path(expanded).is_absolute() ? fs::path(expanded) : fs::path(ckpt) / expanded;
+  if (fs::exists(as_path)) {
+    const fs::path file = fs::is_directory(as_path) ? as_path / "tokenizer.json" : as_path;
+    if (fs::is_regular_file(file)) return file.string();
+  }
+  std::string err;
+  const std::string snapshot = dgpp::hf::model_dir(from, &err);
+  if (!snapshot.empty()) {
+    const fs::path file = fs::path(snapshot) / "tokenizer.json";
+    if (fs::is_regular_file(file)) return file.string();
+    err = "the cached snapshot " + snapshot + " has no tokenizer.json";
+  }
+  throw std::runtime_error("tokenizer_from '" + from + "': not a readable path (tried " +
+                           as_path.string() + ") and not a cached model (" + err + ")");
+}
+
 int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
                  const std::vector<int64_t>& eos_ids, const std::string& ckpt,
+                 const std::string& tokenizer_json,
                  const std::string& model_display, const ServeKnobs& k,
                  bool no_eos, double boot_s,
                  dgpp::serve::JournalWriter* journal,
                  dgpp::serve::OpStreamObserver* oplog, const std::string& family_name) {
-  const dgpp::text::Tokenizer tok =
-      dgpp::text::Tokenizer::load((fs::path(ckpt) / "tokenizer.json").string());
+  const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load(tokenizer_json);
+  // A tokenizer from outside the checkpoint is never silent, and its vocab
+  // must be the model's: a mismatch would mean every id is wrong.
+  if (tokenizer_json != (fs::path(ckpt) / "tokenizer.json").string()) {
+    DGPP_LOG_WARN("serve: tokenizer.json from {} (not the checkpoint's)", tokenizer_json);
+    if (static_cast<int64_t>(tok.token_by_id_size()) > vocab_size)
+      throw std::runtime_error("the tokenizer at " + tokenizer_json + " has " +
+                               std::to_string(tok.token_by_id_size()) +
+                               " tokens, past the model's vocabulary of " +
+                               std::to_string(vocab_size));
+  }
   // The prompt renderer: the checkpoint's chat_template.jinja, or the
   // DeepSeek-V4.1 encoder's format (no Jinja ships with that model).
   std::optional<dgpp::text::ChatTemplate> tpl;
@@ -1057,6 +1093,7 @@ int main(int argc, char** argv) {
   std::string kv_dtype = "bf16";  // the latent cache's format
   std::string ngram_table = "resident";  // the Qwen n-gram table: resident | mmap
   std::string ngram_table_dir;           // empty: the table is in the checkpoint
+  std::string tokenizer_from;            // empty: tokenizer.json from the checkpoint
   std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8
   std::string bf16_weights = "checkpoint";  // the bf16 decode weights' resident form: checkpoint | bf12 | bf12+bf16
   std::string prefill = "bounded";  // the DeepSeek-V4.1 prefill: bounded | exact
@@ -1172,6 +1209,7 @@ int main(int argc, char** argv) {
     if (!c.revision.empty() && model_id.find('@') == std::string::npos)
       model_id += "@" + c.revision;
     if (!e.ngram_table_dir.empty()) ngram_table_dir = e.ngram_table_dir;
+    if (!e.tokenizer_from.empty()) tokenizer_from = e.tokenizer_from;
     // The resident image cache's directory, unless the environment says.
     if (!c.paths.resident_cache.empty())
       setenv("DGPP_RESIDENT_CACHE_DIR",
@@ -1201,6 +1239,7 @@ int main(int argc, char** argv) {
     else if (a == "--kv-dtype") kv_dtype = next();
     else if (a == "--ngram-table") ngram_table = next();
     else if (a == "--ngram-table-dir") ngram_table_dir = next();
+    else if (a == "--tokenizer-from") tokenizer_from = next();
     else if (a == "--dense-weights") dense_weights = next();
     else if (a == "--bf16-weights") bf16_weights = next();
     else if (a == "--prefill") prefill = next();
@@ -1840,7 +1879,7 @@ int main(int argc, char** argv) {
     // they need.
     const dgpp::text::GrammarVocab grammar_vocab = [&] {
       const dgpp::text::Tokenizer tok = dgpp::text::Tokenizer::load(
-          (fs::path(ckpt) / "tokenizer.json").string());
+          resolve_tokenizer_json(ckpt, tokenizer_from));
       dgpp::text::GrammarVocab v = dgpp::text::GrammarVocab::from_tokenizer(
           tok, family->eos_token_ids(), static_cast<int>(family->vocab_size()));
       DGPP_LOG_INFO(
@@ -2125,6 +2164,7 @@ int main(int argc, char** argv) {
         dgpp::serve::OpStreamObserver oplog;  // rank 0's audit leg
         open_ops_file(&oplog, "serve_rank0.ops");
         const int rc = serve_openai(engine_ptr(), family->vocab_size(), family->eos_token_ids(), ckpt,
+                                    resolve_tokenizer_json(ckpt, tokenizer_from),
                                     model_display, knobs, no_eos, boot_s(), journal ? &*journal : nullptr, &oplog,
                                     family->name());
         engine_release();
@@ -2168,6 +2208,7 @@ int main(int argc, char** argv) {
         max_concurrency, dgpp::make_w1_pick(family->vocab_size()), dgpp::make_w1_sample(family->vocab_size()),
         &grammar_vocab, prefix_slots);
     const int rc = serve_openai(engine.get(), family->vocab_size(), family->eos_token_ids(), ckpt,
+                                    resolve_tokenizer_json(ckpt, tokenizer_from),
                                 model_display, knobs, no_eos, boot_s(), /*journal=*/nullptr,
                                 /*oplog=*/nullptr, family->name());
     engine.reset();

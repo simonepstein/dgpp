@@ -62,6 +62,14 @@ struct ClusterConfig {
     // checkpoint, as every other release. A model property, not a site one,
     // so it belongs here beside the table's residency rather than in paths.
     std::string ngram_table_dir;
+    // Where to read tokenizer.json, when the checkpoint's own cannot be
+    // used — a repackaged release that shipped a pre-tokenizer its vocab
+    // was not trained under, say. A path (file or directory, absolute,
+    // ~-expanded, or relative to the checkpoint) or a cached Hub model id,
+    // optionally org/name@revision. Empty: the checkpoint's own, as every
+    // other release. Only tokenizer.json moves; the chat template and the
+    // rest still come from the checkpoint.
+    std::string tokenizer_from;
     // The Qwen dense stack's form: "checkpoint" (the default:
     // the BF16 the checkpoint ships) or "fp8" (every dense projection
     // encoded to block FP8 at load — the same recipe as the FP8 releases;
