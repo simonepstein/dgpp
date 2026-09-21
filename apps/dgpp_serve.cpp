@@ -1120,6 +1120,7 @@ int main(int argc, char** argv) {
   std::string ngram_table_dir;           // empty: the table is in the checkpoint
   std::string tokenizer_from;            // empty: tokenizer.json from the checkpoint
   std::string chat_template;             // empty: the checkpoint's chat_template.jinja
+  int mtp_experts = 0;                   // 0: the draft routes the model's own top-k
   std::string dense_weights = "checkpoint";  // the Qwen dense stack: checkpoint | fp8
   std::string bf16_weights = "checkpoint";  // the bf16 decode weights' resident form: checkpoint | bf12 | bf12+bf16
   std::string prefill = "bounded";  // the DeepSeek-V4.1 prefill: bounded | exact
@@ -1237,6 +1238,7 @@ int main(int argc, char** argv) {
     if (!e.ngram_table_dir.empty()) ngram_table_dir = e.ngram_table_dir;
     if (!e.tokenizer_from.empty()) tokenizer_from = e.tokenizer_from;
     if (!e.chat_template.empty()) chat_template = e.chat_template;
+    if (e.mtp_experts != 0) mtp_experts = e.mtp_experts;
     // The resident image cache's directory, unless the environment says.
     if (!c.paths.resident_cache.empty())
       setenv("DGPP_RESIDENT_CACHE_DIR",
@@ -1268,6 +1270,7 @@ int main(int argc, char** argv) {
     else if (a == "--ngram-table-dir") ngram_table_dir = next();
     else if (a == "--tokenizer-from") tokenizer_from = next();
     else if (a == "--chat-template") chat_template = next();
+    else if (a == "--mtp-experts") mtp_experts = std::stoi(next());
     else if (a == "--dense-weights") dense_weights = next();
     else if (a == "--bf16-weights") bf16_weights = next();
     else if (a == "--prefill") prefill = next();
@@ -1535,6 +1538,8 @@ int main(int argc, char** argv) {
   // The Qwen n-gram table's residency: set before the plan and the load
   // (both read it; the table's bytes leave the plan under mmap).
   dgpp::QwenLayerStream::set_ngram_table_mmap(ngram_table == "mmap");
+  // The draft layer's own top-k (read by the memory plan and the model).
+  dgpp::QwenModel::set_mtp_experts_per_tok(mtp_experts);
   // The table's directory when the release ships it beside the checkpoint.
   // A relative path is the checkpoint's own subdirectory, so a deployment
   // config can say "ple-table" without knowing where the cache put the

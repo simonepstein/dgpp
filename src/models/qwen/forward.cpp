@@ -111,6 +111,8 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   // The routed chain on this rank's slice of the intermediate dim.
   moe_cfg_ = QwenMoeLayer::routed_config(H, static_cast<int>(loader_.geometry().local_inter),
                                          cfg_.num_experts, cfg_.num_experts_per_tok, cfg_.norm_topk_prob);
+  mtp_moe_cfg_ = QwenMoeLayer::routed_config(H, static_cast<int>(loader_.geometry().local_inter),
+                                             cfg_.num_experts, draft_top_k(cfg_), cfg_.norm_topk_prob);
 
   // Per-slot state from the local geometry (the layer objects agree — they
   // are built from the same numbers).
@@ -161,7 +163,9 @@ QwenModel::QwenModel(const QwenTextConfig& cfg, const std::string& checkpoint_di
   y_ = dev_alloc<uint16_t>(M * H);
   {
     const size_t layers = static_cast<size_t>(cfg_.num_hidden_layers) + (mtp_ ? 1 : 0);
-    const size_t K = static_cast<size_t>(cfg_.num_experts_per_tok);
+    // The draft may route wider than the stack: one slot per layer, sized
+    // for whichever k is larger.
+    const size_t K = static_cast<size_t>(std::max(cfg_.num_experts_per_tok, draft_top_k(cfg_)));
     h_route_ids_ = pinned_alloc<int32_t>(layers * M * K);
     h_route_weights_ = pinned_alloc<float>(layers * M * K);
     if (const char* v = std::getenv("DGPP_QWEN_MOE_PREFILL"); v && std::string(v) == "host")
@@ -292,10 +296,24 @@ QwenModel::MemoryPlan QwenModel::plan_memory(const QwenTextConfig& cfg, int max_
   const GlmMoeConfig moe_cfg = QwenMoeLayer::routed_config(cfg.hidden_size, static_cast<int>(geo.local_inter),
                                                            cfg.num_experts, cfg.num_experts_per_tok, cfg.norm_topk_prob);
   size_t moe_pinned = 0;
-  const int table_slots = residency == QwenResidency::Resident ? cfg.num_hidden_layers + (mtp ? 1 : 0) : 0;
+  const int draft_k = draft_top_k(cfg);
+  const bool draft_moe = mtp && draft_k != cfg.num_experts_per_tok;
+  const int stack_slots = residency == QwenResidency::Resident
+                              ? cfg.num_hidden_layers + (mtp && !draft_moe ? 1 : 0)
+                              : 0;
   const size_t moe_dev = QwenMoeLayer::scratch_bytes(moe_cfg, geo.local_shared_inter, max_tokens, &moe_pinned,
-                                                     static_cast<int>(rows), table_slots);
+                                                     static_cast<int>(rows), stack_slots);
   plan.add("moe scratch (routed slots, shared expert, graph tables)", moe_dev, moe_pinned);
+  if (draft_moe) {
+    // The draft routes its own top-k, so it carries its own routed slots.
+    const GlmMoeConfig d_cfg = QwenMoeLayer::routed_config(
+        cfg.hidden_size, static_cast<int>(geo.local_inter), cfg.num_experts, draft_k, cfg.norm_topk_prob);
+    size_t d_pinned = 0;
+    const size_t d_dev = QwenMoeLayer::scratch_bytes(
+        d_cfg, geo.local_shared_inter, max_tokens, &d_pinned, static_cast<int>(rows),
+        residency == QwenResidency::Resident ? 1 : 0);
+    plan.add("draft moe scratch (its own top-k)", d_dev, d_pinned);
+  }
   if (mtp) {
     plan.add("draft block (hyper-state window, ring snapshot, fusion scratch, mixer)",
              R * rows * W * 2 + R * ring_elems * 2 + 4 * M * W * 2 + 3 * M * H * 2 + R * 24 +
@@ -332,6 +350,23 @@ QwenModel::~QwenModel() {
   cudaFree(mtp_e_);
   cudaFree(mtp_en_);
   cudaFree(mtp_ein_);
+}
+
+namespace {
+int g_mtp_experts_per_tok = 0;  // 0: the draft routes the model's own k
+}  // namespace
+
+void QwenModel::set_mtp_experts_per_tok(int k) { g_mtp_experts_per_tok = k; }
+int QwenModel::mtp_experts_per_tok() { return g_mtp_experts_per_tok; }
+
+int QwenModel::draft_top_k(const QwenTextConfig& cfg) {
+  const int k = g_mtp_experts_per_tok;
+  if (k <= 0) return cfg.num_experts_per_tok;
+  if (k > cfg.num_experts || k > 16)
+    throw std::invalid_argument(
+        "QwenModel: the draft's experts per token must be in [1, min(num_experts, 16)], got " +
+        std::to_string(k));
+  return k;
 }
 
 QwenMoeWeights QwenModel::moe_view(const QwenMoeResident& m) {
@@ -431,16 +466,23 @@ void QwenModel::build_layer_objects(const QwenLayerResident& r) {
       qsa_->rebind(r.qsa);
     }
   }
-  if (!moe_) {
+  // The draft layer keeps its own MoE object when it routes a different
+  // top-k; otherwise the stack's is rebound to it as before.
+  const bool draft_layer = mtp_ && r.layer == cfg_.mtp_layer() &&
+                           mtp_moe_cfg_.top_k != moe_cfg_.top_k;
+  std::unique_ptr<QwenMoeLayer>& moe = draft_layer ? mtp_moe_ : moe_;
+  if (!moe) {
     // The decode fast path's provisioning: the decode-row ceiling's slot rows and one
     // graph table slot per MoE layer (resident stacks bake them in).
+    const bool resident = loader_.residency() == QwenResidency::Resident;
     const int table_slots =
-        loader_.residency() == QwenResidency::Resident ? n_moe_layers_ + (mtp_ ? 1 : 0) : 0;
-    moe_ = std::make_unique<QwenMoeLayer>(moe_view(r.moe), moe_cfg_, gemm_, max_tokens_, max_decode_rows_,
-                                          table_slots);
-    moe_->set_mma_from_rows(gw_.mma_from_rows);
+        draft_layer ? (resident ? 1 : 0)
+                    : (resident ? n_moe_layers_ + (mtp_ && mtp_moe_cfg_.top_k == moe_cfg_.top_k ? 1 : 0) : 0);
+    moe = std::make_unique<QwenMoeLayer>(moe_view(r.moe), draft_layer ? mtp_moe_cfg_ : moe_cfg_, gemm_,
+                                         max_tokens_, max_decode_rows_, table_slots);
+    moe->set_mma_from_rows(gw_.mma_from_rows);
   } else {
-    moe_->rebind(moe_view(r.moe));
+    moe->rebind(moe_view(r.moe));
   }
   if (r.has_ple) {
     if (!ple_) {
@@ -758,7 +800,7 @@ QwenModel::Outputs QwenModel::run_rows(const RowRun& run) {
       // sync per layer; the routing rides async copies into this layer's
       // pinned slot and is materialized after the final sync.
       MoeTraceStaging trace;
-      const size_t K = static_cast<size_t>(cfg_.num_experts_per_tok);
+      const size_t K = static_cast<size_t>(std::max(cfg_.num_experts_per_tok, draft_top_k(cfg_)));
       const size_t slot = static_cast<size_t>(layer) * static_cast<size_t>(max_tokens_) * K;
       trace.ids = h_route_ids_ + slot;
       trace.weights = h_route_weights_ + slot;
@@ -981,10 +1023,15 @@ void QwenModel::graph_prepare() {
     if (pack) pack_layer_companions(layer, r);
   }
   if (mtp_) {
-    // The draft layer's MoE takes the slot after the main stack's.
+    // The draft layer's MoE takes the slot after the main stack's — or slot
+    // 0 of its own table, when it routes its own top-k and so carries its
+    // own layer object.
     const QwenLayerResident& r = loader_.load_layer(cfg_.mtp_layer());
     build_layer_objects(r);
-    moe_->prepare_graph_table(n_moe_layers_, stream_);
+    if (mtp_moe_)
+      mtp_moe_->prepare_graph_table(0, stream_);
+    else
+      moe_->prepare_graph_table(n_moe_layers_, stream_);
     if (pack) pack_layer_companions(cfg_.mtp_layer(), r);
   }
   if (pack) finish_companions();
@@ -1140,12 +1187,16 @@ void QwenModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos, 
   attn_gr_->combine(mtp_r_, attn_out, T, stream_);
   mlp_gr_->mix(mtp_r_, x_, T, stream_);
   uint16_t* ffn_out = stage(y_, H);
+  // The draft's own MoE object when it routes a different top-k (its graph
+  // table is one slot, so slot 0); otherwise the stack's, in its own slot.
+  QwenMoeLayer& draft_moe = mtp_moe_ ? *mtp_moe_ : *moe_;
+  const int draft_slot = mtp_moe_ ? 0 : n_moe_layers_;
   if (decode_row)
-    moe_->enqueue_decode(x_, ffn_out, T, stream_, capture ? n_moe_layers_ : -1);
+    draft_moe.enqueue_decode(x_, ffn_out, T, stream_, capture ? draft_slot : -1);
   else if (moe_prefill_host_path_)
-    moe_->enqueue(x_, ffn_out, T, stream_);
+    draft_moe.enqueue(x_, ffn_out, T, stream_);
   else
-    moe_->enqueue_prefill(x_, ffn_out, T, stream_);
+    draft_moe.enqueue_prefill(x_, ffn_out, T, stream_);
   if (decode_row) prefetch_head(globals_.mtp_mixer);
   fold(ffn_out, H);
   mlp_gr_->combine(mtp_r_, ffn_out, T, stream_);

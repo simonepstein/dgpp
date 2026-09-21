@@ -164,6 +164,18 @@ class QwenModel : public SessionModel<QwenModel> {
   void snapshot_chain_state(int req);
   void restore_chain_state(int req);
 
+  // How many experts the MTP draft layer routes over (engine.mtp_experts,
+  // 0 = the model's own num_experts_per_tok). The draft is the same tensors
+  // either way — routing wider costs one layer's expert reads per step and
+  // buys acceptance, which is what a speculative step is paid in. The
+  // upstream serving recipe for the AutoRound release drafts at 10 while
+  // the model runs at 5. Set before the model is built; the memory plan
+  // reads it too.
+  static void set_mtp_experts_per_tok(int k);
+  static int mtp_experts_per_tok();
+  // The draft's effective k for this config.
+  static int draft_top_k(const QwenTextConfig& cfg);
+
  private:
   static constexpr int kBlockTokens = 64;
   static constexpr int kPrefillChunkTokens = 2048;
@@ -171,6 +183,7 @@ class QwenModel : public SessionModel<QwenModel> {
   void build_layer_objects(const QwenLayerResident& r);
   void lm_head_logits(const uint16_t* hidden, int rows, cudaStream_t stream);
   static size_t dense_bridge_bytes(const QwenTextConfig& cfg, const QwenLocalGeometry& geo);
+
   size_t dense_bridge_bytes_ = 0;
   static QwenMoeWeights moe_view(const QwenMoeResident& m);
   float* gdn_rec(int req, int ordinal) const;
@@ -197,8 +210,13 @@ class QwenModel : public SessionModel<QwenModel> {
   std::unique_ptr<QwenGdnLayer> gdn_;
   std::unique_ptr<QwenQsaLayer> qsa_;
   std::unique_ptr<QwenMoeLayer> moe_;
+  // The draft layer routes its own top-k, so it needs its own layer object:
+  // top_k sizes the routed buffers and the slot scratch, which the shared
+  // one has baked in at the model's k.
+  std::unique_ptr<QwenMoeLayer> mtp_moe_;
   std::unique_ptr<QwenPleLayer> ple_;
   GlmMoeConfig moe_cfg_;
+  GlmMoeConfig mtp_moe_cfg_;
 
   // Per-slot state.
   int num_gdn_ = 0, num_qsa_ = 0;

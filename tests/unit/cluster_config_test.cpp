@@ -109,7 +109,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
                "admission": "grow", "stats_interval_s": 0, "mtp_depth": 2, "prefill": "exact",
                "prefill_budget_tokens": 256, "prefill_idle_budget_tokens": 2048,
                "ngram_table_dir": "ple-table", "tokenizer_from": "org/other",
-               "chat_template": "medium"},
+               "chat_template": "medium", "mtp_experts": 10},
     "paths": {"log_dir": "/var/log/dgpp"}
   })";
   const dgpp::serve::ClusterConfig c = dgpp::serve::parse_cluster_config(json, "t");
@@ -153,6 +153,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
           "tokenizer.json from outside the checkpoint");
   require(c.engine.chat_template == "medium",
           "the named chat template the speculative head was trained on");
+  require(c.engine.mtp_experts == 10, "the draft's own experts per token");
   // A one-node config is a world of one.
   const dgpp::serve::ClusterConfig one =
       dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t");

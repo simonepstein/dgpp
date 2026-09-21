@@ -77,6 +77,10 @@ struct ClusterConfig {
     // (then <ckpt>/<name>); a path is taken as given. Empty: the
     // checkpoint's own chat_template.jinja, as every other release.
     std::string chat_template;
+    // How many experts the MTP draft layer routes over; 0 = the model's
+    // own. The draft is the same tensors either way, so routing wider
+    // costs one layer's expert reads per step and buys acceptance.
+    int mtp_experts = 0;
     // The Qwen dense stack's form: "checkpoint" (the default:
     // the BF16 the checkpoint ships) or "fp8" (every dense projection
     // encoded to block FP8 at load — the same recipe as the FP8 releases;
